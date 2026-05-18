@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# codex-acct — switch between Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
+set -euo pipefail
+
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+AUTH="$CODEX_DIR/auth.json"
+ACCTS="$CODEX_DIR/accounts"
+PRIMARY_FILE="$ACCTS/.primary"
+ACTIVE_FILE="$ACCTS/.active"
+PREV_NAME="_previous"
+
+mkdir -p "$ACCTS"
+chmod 700 "$ACCTS"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+slot_path() {
+  local name="$1"
+  echo "$ACCTS/$name.json"
+}
+
+write_active_name() {
+  local name="$1"
+  echo -n "$name" > "$ACTIVE_FILE"
+  chmod 600 "$ACTIVE_FILE"
+}
+
+copy_auth_atomic() {
+  local src="$1"
+  local dest="$2"
+  local tmp
+  tmp=$(mktemp "$CODEX_DIR/.auth.XXXXXX")
+  cp "$src" "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+save_previous_snapshot() {
+  [[ -f "$AUTH" ]] || return 0
+  install -m 600 "$AUTH" "$(slot_path "$PREV_NAME")"
+}
+
+sync_active_slot() {
+  [[ -f "$AUTH" ]] || return 0
+  local active dest
+  active=$(active_name)
+  [[ -n "$active" ]] || return 0
+  dest=$(slot_path "$active")
+  [[ -f "$dest" ]] || return 0
+  install -m 600 "$AUTH" "$dest"
+}
+
+# Decode the JWT id_token from a given auth.json path. Prints TAB-separated: email<TAB>plan<TAB>sub<TAB>account_id
+decode_auth() {
+  local file="$1"
+  [[ -f "$file" ]] || { printf '\t\t\t\n'; return; }
+  python3 - "$file" <<'PY'
+import json, sys, base64
+try:
+    d = json.load(open(sys.argv[1]))
+    tok = d["tokens"]["id_token"]
+    payload = tok.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    p = json.loads(base64.urlsafe_b64decode(payload))
+    email = p.get("email", "")
+    plan = p.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type", "")
+    sub = p.get("sub", "")
+    acct = d.get("tokens", {}).get("account_id", "")
+    print(f"{email}\t{plan}\t{sub}\t{acct}")
+except Exception as e:
+    print(f"\t\t\t  ({e})")
+PY
+}
+
+current_sub() { decode_auth "$AUTH" | cut -f3; }
+active_name() { [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || echo ""; }
+primary_name() { [[ -f "$PRIMARY_FILE" ]] && cat "$PRIMARY_FILE" || echo ""; }
+
+cmd_who() {
+  [[ -f "$AUTH" ]] || die "no $AUTH — run: codex login"
+  IFS=$'\t' read -r email plan sub acct < <(decode_auth "$AUTH")
+  echo "email:      ${email:-?}"
+  echo "plan:       ${plan:-?}"
+  echo "account_id: ${acct:-?}"
+  local active; active=$(active_name)
+  [[ -n "$active" ]] && echo "slot:       $active"
+  local prim; prim=$(primary_name)
+  if [[ -n "$prim" && -f "$ACCTS/$prim.json" ]]; then
+    local psub; psub=$(decode_auth "$ACCTS/$prim.json" | cut -f3)
+    if [[ "$psub" == "$sub" ]]; then
+      echo "status:     active is PRIMARY ($prim) — macbook pairing intact"
+    else
+      echo "status:     NOT primary (primary=$prim) — macbook pairing may be broken until restored"
+    fi
+  fi
+}
+
+cmd_list() {
+  local cur_sub; cur_sub=$(current_sub)
+  local prim; prim=$(primary_name)
+  shopt -s nullglob
+  local files=("$ACCTS"/*.json)
+  if (( ${#files[@]} == 0 )); then
+    echo "(no saved accounts — use: codex-acct save <name>)"
+    return
+  fi
+  printf '%-20s %-32s %-8s %s\n' "NAME" "EMAIL" "PLAN" "FLAGS"
+  for f in "${files[@]}"; do
+    local name; name=$(basename "$f" .json)
+    IFS=$'\t' read -r email plan sub _acct < <(decode_auth "$f")
+    local flags=""
+    [[ "$sub" == "$cur_sub" && -n "$sub" ]] && flags+="active "
+    [[ "$name" == "$prim" ]] && flags+="primary "
+    printf '%-20s %-32s %-8s %s\n' "$name" "${email:-?}" "${plan:-?}" "$flags"
+  done
+}
+
+require_name() {
+  [[ -n "${1:-}" ]] || die "usage: codex-acct $2 <name>"
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "name must match [A-Za-z0-9_-]+"
+}
+
+cmd_save() {
+  require_name "${1:-}" save
+  local name="$1"
+  [[ -f "$AUTH" ]] || die "no $AUTH to save"
+  local dest="$ACCTS/$name.json"
+  if [[ -f "$dest" && "${2:-}" != "--force" ]]; then
+    die "$dest exists — pass --force to overwrite"
+  fi
+  install -m 600 "$AUTH" "$dest"
+  IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
+  # If this save matches the active auth, mark the slot active so future swaps refresh it.
+  local cur_sub psub; cur_sub=$(current_sub); psub=$(decode_auth "$dest" | cut -f3)
+  if [[ -n "$cur_sub" && "$cur_sub" == "$psub" ]]; then
+    write_active_name "$name"
+  fi
+  echo "saved: $name  ($email, $plan)"
+}
+
+cmd_use() {
+  require_name "${1:-}" use
+  local name="$1"
+  local src="$ACCTS/$name.json"
+  [[ -f "$src" ]] || die "no saved account '$name' (see: codex-acct list)"
+
+  local prim; prim=$(primary_name)
+  if [[ -n "$prim" && -f "$ACCTS/$prim.json" ]]; then
+    local cur_sub psub; cur_sub=$(current_sub); psub=$(decode_auth "$ACCTS/$prim.json" | cut -f3)
+    if [[ "$cur_sub" == "$psub" && "$name" != "$prim" ]]; then
+      echo "note: leaving primary account ($prim) — macbook pairing will stop working until you restore it."
+    fi
+  fi
+
+  # Refresh-token freshness: persist the LIVE auth.json back into its named slot before swapping.
+  # auth.json rotates over time (refresh on use); snapshots can otherwise grow stale.
+  if [[ -f "$AUTH" ]]; then
+    local active; active=$(active_name)
+    if [[ -n "$active" && "$active" != "$name" ]]; then
+      sync_active_slot
+    fi
+    save_previous_snapshot
+  fi
+
+  copy_auth_atomic "$src" "$AUTH"
+
+  write_active_name "$name"
+  IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
+  echo "now using: $name  ($email, $plan)"
+}
+
+cmd_add() {
+  require_name "${1:-}" add
+  local name="$1"
+  local dest="$ACCTS/$name.json"
+  [[ -f "$dest" ]] && die "$dest exists — pick a new name or rm it first"
+
+  sync_active_slot
+  save_previous_snapshot
+  echo "Running 'codex logout' then 'codex login'..."
+  codex logout || true
+  codex login
+  [[ -f "$AUTH" ]] || die "login did not produce $AUTH"
+  install -m 600 "$AUTH" "$dest"
+  write_active_name "$name"
+  IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
+  echo "added & active: $name  ($email, $plan)"
+}
+
+cmd_primary() {
+  require_name "${1:-}" primary
+  local name="$1"
+  [[ -f "$ACCTS/$name.json" ]] || die "no saved account '$name'"
+  echo -n "$name" > "$PRIMARY_FILE"
+  chmod 600 "$PRIMARY_FILE"
+  echo "primary set to: $name"
+}
+
+cmd_restore() {
+  local src="$ACCTS/$PREV_NAME.json"
+  [[ -f "$src" ]] || die "no previous account snapshot to restore"
+  # Save live state back to its named slot first (freshness)
+  sync_active_slot
+  copy_auth_atomic "$src" "$AUTH"
+  # Try to figure out which named slot the restored auth corresponds to
+  local rsub; rsub=$(current_sub)
+  local matched=""
+  shopt -s nullglob
+  for f in "$ACCTS"/*.json; do
+    local nm; nm=$(basename "$f" .json); [[ "$nm" == "$PREV_NAME" ]] && continue
+    [[ "$(decode_auth "$f" | cut -f3)" == "$rsub" && -n "$rsub" ]] && { matched="$nm"; break; }
+  done
+  if [[ -n "$matched" ]]; then write_active_name "$matched"
+  else rm -f "$ACTIVE_FILE"
+  fi
+  IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
+  echo "restored previous: ($email, $plan)${matched:+  [active slot: $matched]}"
+}
+
+cmd_sync() {
+  sync_active_slot
+  local active; active=$(active_name)
+  if [[ -n "$active" ]]; then
+    echo "synced: $active"
+  else
+    echo "synced: no active slot"
+  fi
+}
+
+cmd_run_codex() {
+  local rc=0
+  sync_active_slot
+  codex "$@" || rc=$?
+  sync_active_slot
+  return "$rc"
+}
+
+cmd_rm() {
+  require_name "${1:-}" rm
+  local name="$1"
+  local f="$ACCTS/$name.json"
+  [[ -f "$f" ]] || die "no saved account '$name'"
+  rm -f "$f"
+  [[ "$(primary_name)" == "$name" ]] && rm -f "$PRIMARY_FILE"
+  echo "removed: $name"
+}
+
+usage() {
+  cat <<EOF
+codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
+
+  codex-acct who                     show current account
+  codex-acct list                    list saved accounts
+  codex-acct save <name> [--force]   snapshot current auth.json as <name>
+  codex-acct use  <name>             switch to saved <name> (atomic swap)
+  codex-acct add  <name>             run codex login, save result as <name>
+  codex-acct sync                    persist live auth.json into the active slot
+  codex-acct codex [args...]         run codex, then save any rotated tokens on exit
+  codex-acct primary <name>          mark <name> as the macbook-paired account
+  codex-acct restore                 swap back to the previous account
+  codex-acct rm   <name>             delete a saved account
+
+Storage: $ACCTS  (mode 0600)
+EOF
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  who) cmd_who "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  save) cmd_save "$@" ;;
+  use|switch) cmd_use "$@" ;;
+  add|login) cmd_add "$@" ;;
+  sync) cmd_sync "$@" ;;
+  codex|run) cmd_run_codex "$@" ;;
+  primary) cmd_primary "$@" ;;
+  restore) cmd_restore "$@" ;;
+  rm|remove|delete) cmd_rm "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) cmd_run_codex "$sub" "$@" ;;
+esac
