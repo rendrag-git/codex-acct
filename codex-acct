@@ -8,11 +8,53 @@ ACCTS="$CODEX_DIR/accounts"
 PRIMARY_FILE="$ACCTS/.primary"
 ACTIVE_FILE="$ACCTS/.active"
 PREV_NAME="_previous"
+LOCK_DIR="$CODEX_DIR/.codex-acct.lock"
+LOCK_HELD=0
+SYNCED_SLOT=""
+SYNC_NOTE=""
 
 mkdir -p "$ACCTS"
 chmod 700 "$ACCTS"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+release_lock() {
+  if [[ "$LOCK_HELD" == "1" ]]; then
+    rm -rf "$LOCK_DIR"
+    LOCK_HELD=0
+  fi
+}
+
+acquire_lock() {
+  local tries=0 max_tries="${CODEX_ACCT_LOCK_TRIES:-300}"
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [[ -f "$LOCK_DIR/pid" ]]; then
+      local pid; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+      if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+        rm -rf "$LOCK_DIR"
+        continue
+      fi
+    fi
+    (( tries += 1 ))
+    if (( tries >= max_tries )); then
+      die "timed out waiting for account lock: $LOCK_DIR"
+    fi
+    sleep 0.1
+  done
+  LOCK_HELD=1
+  echo "$$" > "$LOCK_DIR/pid"
+  chmod 700 "$LOCK_DIR"
+  trap release_lock EXIT INT TERM
+}
+
+with_lock() {
+  acquire_lock
+  local rc=0
+  "$@" || rc=$?
+  release_lock
+  trap - EXIT INT TERM
+  return "$rc"
+}
 
 slot_path() {
   local name="$1"
@@ -37,17 +79,54 @@ copy_auth_atomic() {
 
 save_previous_snapshot() {
   [[ -f "$AUTH" ]] || return 0
-  install -m 600 "$AUTH" "$(slot_path "$PREV_NAME")"
+  copy_auth_atomic "$AUTH" "$(slot_path "$PREV_NAME")"
 }
 
 sync_active_slot() {
+  SYNCED_SLOT=""
+  SYNC_NOTE=""
   [[ -f "$AUTH" ]] || return 0
-  local active dest
+  local live_sub active dest match matches_count
+  live_sub=$(auth_sub "$AUTH" || true)
+  if [[ -z "$live_sub" ]]; then
+    SYNC_NOTE="auth.json has no decodable identity; not syncing"
+    return 0
+  fi
+
   active=$(active_name)
-  [[ -n "$active" ]] || return 0
-  dest=$(slot_path "$active")
-  [[ -f "$dest" ]] || return 0
-  install -m 600 "$AUTH" "$dest"
+  if [[ -n "$active" ]]; then
+    dest=$(slot_path "$active")
+    if [[ -f "$dest" ]]; then
+      if auth_matches "$AUTH" "$dest"; then
+        copy_auth_atomic "$AUTH" "$dest"
+        SYNCED_SLOT="$active"
+        return 0
+      fi
+    fi
+  fi
+
+  match=""
+  matches_count=0
+  shopt -s nullglob
+  for dest in "$ACCTS"/*.json; do
+    local name
+    name=$(basename "$dest" .json)
+    [[ "$name" == "$PREV_NAME" ]] && continue
+    if auth_matches "$AUTH" "$dest"; then
+      match="$name"
+      (( matches_count++ ))
+    fi
+  done
+
+  if (( matches_count == 1 )); then
+    copy_auth_atomic "$AUTH" "$(slot_path "$match")"
+    write_active_name "$match"
+    SYNCED_SLOT="$match"
+  elif (( matches_count > 1 )); then
+    SYNC_NOTE="multiple saved slots match live auth; not guessing"
+  else
+    SYNC_NOTE="no saved slot matches live auth; not syncing"
+  fi
 }
 
 # Decode the JWT id_token from a given auth.json path. Prints TAB-separated: email<TAB>plan<TAB>sub<TAB>account_id
@@ -73,6 +152,24 @@ PY
 }
 
 current_sub() { decode_auth "$AUTH" | cut -f3; }
+auth_sub() {
+  local file="$1"
+  local email plan sub acct
+  IFS=$'\t' read -r email plan sub acct < <(decode_auth "$file")
+  [[ -n "$sub" ]] || return 1
+  printf '%s\n' "$sub"
+}
+auth_matches() {
+  local left="$1" right="$2"
+  local left_email left_plan left_sub left_acct
+  local right_email right_plan right_sub right_acct
+  IFS=$'\t' read -r left_email left_plan left_sub left_acct < <(decode_auth "$left")
+  IFS=$'\t' read -r right_email right_plan right_sub right_acct < <(decode_auth "$right")
+  [[ -n "$left_sub" && "$left_sub" == "$right_sub" ]] || return 1
+  if [[ -n "$left_acct" && -n "$right_acct" && "$left_acct" != "$right_acct" ]]; then
+    return 1
+  fi
+}
 active_name() { [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || echo ""; }
 primary_name() { [[ -f "$PRIMARY_FILE" ]] && cat "$PRIMARY_FILE" || echo ""; }
 
@@ -128,7 +225,7 @@ cmd_save() {
   if [[ -f "$dest" && "${2:-}" != "--force" ]]; then
     die "$dest exists — pass --force to overwrite"
   fi
-  install -m 600 "$AUTH" "$dest"
+  copy_auth_atomic "$AUTH" "$dest"
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
   # If this save matches the active auth, mark the slot active so future swaps refresh it.
   local cur_sub psub; cur_sub=$(current_sub); psub=$(decode_auth "$dest" | cut -f3)
@@ -155,10 +252,7 @@ cmd_use() {
   # Refresh-token freshness: persist the LIVE auth.json back into its named slot before swapping.
   # auth.json rotates over time (refresh on use); snapshots can otherwise grow stale.
   if [[ -f "$AUTH" ]]; then
-    local active; active=$(active_name)
-    if [[ -n "$active" && "$active" != "$name" ]]; then
-      sync_active_slot
-    fi
+    sync_active_slot
     save_previous_snapshot
   fi
 
@@ -177,11 +271,24 @@ cmd_add() {
 
   sync_active_slot
   save_previous_snapshot
-  echo "Running 'codex logout' then 'codex login'..."
-  codex logout || true
-  codex login
+  local held_auth=""
+  if [[ -f "$AUTH" ]]; then
+    held_auth=$(mktemp "$CODEX_DIR/.auth-held.XXXXXX")
+    copy_auth_atomic "$AUTH" "$held_auth"
+    rm -f "$AUTH"
+  fi
+
+  echo "Running 'codex login'..."
+  if ! codex login; then
+    if [[ -n "$held_auth" && -f "$held_auth" ]]; then
+      copy_auth_atomic "$held_auth" "$AUTH"
+      rm -f "$held_auth"
+    fi
+    die "codex login failed; restored previous auth"
+  fi
+  rm -f "$held_auth"
   [[ -f "$AUTH" ]] || die "login did not produce $AUTH"
-  install -m 600 "$AUTH" "$dest"
+  copy_auth_atomic "$AUTH" "$dest"
   write_active_name "$name"
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
   echo "added & active: $name  ($email, $plan)"
@@ -219,19 +326,20 @@ cmd_restore() {
 
 cmd_sync() {
   sync_active_slot
-  local active; active=$(active_name)
-  if [[ -n "$active" ]]; then
-    echo "synced: $active"
+  if [[ -n "$SYNCED_SLOT" ]]; then
+    echo "synced: $SYNCED_SLOT"
+  elif [[ -n "$SYNC_NOTE" ]]; then
+    echo "synced: skipped ($SYNC_NOTE)"
   else
-    echo "synced: no active slot"
+    echo "synced: no auth"
   fi
 }
 
 cmd_run_codex() {
   local rc=0
-  sync_active_slot
+  with_lock sync_active_slot
   codex "$@" || rc=$?
-  sync_active_slot
+  with_lock sync_active_slot
   return "$rc"
 }
 
@@ -320,14 +428,14 @@ sub="${1:-}"; shift || true
 case "$sub" in
   who) cmd_who "$@" ;;
   list|ls) cmd_list "$@" ;;
-  save) cmd_save "$@" ;;
-  use|switch) cmd_use "$@" ;;
-  add|login) cmd_add "$@" ;;
-  sync) cmd_sync "$@" ;;
+  save) with_lock cmd_save "$@" ;;
+  use|switch) with_lock cmd_use "$@" ;;
+  add|login) with_lock cmd_add "$@" ;;
+  sync) with_lock cmd_sync "$@" ;;
   codex|run) cmd_run_codex "$@" ;;
-  primary) cmd_primary "$@" ;;
-  restore) cmd_restore "$@" ;;
-  rm|remove|delete) cmd_rm "$@" ;;
+  primary) with_lock cmd_primary "$@" ;;
+  restore) with_lock cmd_restore "$@" ;;
+  rm|remove|delete) with_lock cmd_rm "$@" ;;
   watch) cmd_watch "$@" ;;
   ""|-h|--help|help) usage ;;
   *) cmd_run_codex "$sub" "$@" ;;

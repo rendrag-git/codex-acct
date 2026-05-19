@@ -36,7 +36,7 @@ Polling interval defaults to 3 s — override with `CODEX_ACCT_WATCH_INTERVAL=<s
 ## Usage
 
 ```sh
-codex-acct add personal        # runs `codex login`, saves the result as "personal"
+codex-acct add personal        # runs `codex login` without revoking the current saved account
 codex-acct add work            # log in to a second account, save as "work"
 codex-acct use personal        # atomic swap back
 codex-acct list                # show all saved accounts + which is active
@@ -56,7 +56,7 @@ codex-acct save personal       # snapshot the current ~/.codex/auth.json
 
 ## How it works
 
-`codex login` writes JWTs and a refresh token to `~/.codex/auth.json`. `codex-acct` keeps named copies of that file under `~/.codex/accounts/<name>.json` and atomically swaps the active one into place. Before each swap it also copies the live `auth.json` back into the previously-active slot so any token refresh that happened during use is preserved.
+`codex login` writes JWTs and a refresh token to `~/.codex/auth.json`. `codex-acct` keeps named copies of that file under `~/.codex/accounts/<name>.json` and atomically swaps the active one into place. Before each swap it also copies the live `auth.json` back into the matching saved slot so any token refresh that happened during use is preserved. The tool validates the account identity before saving live auth into a slot, so a stale `.active` marker or background watcher cannot overwrite the wrong saved account.
 
 ## License
 
