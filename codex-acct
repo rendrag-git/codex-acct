@@ -245,6 +245,55 @@ cmd_rm() {
   echo "removed: $name"
 }
 
+WATCH_PID_FILE="$CODEX_DIR/watch.pid"
+WATCH_LOG_FILE="$CODEX_DIR/watch.log"
+
+watch_running() {
+  [[ -f "$WATCH_PID_FILE" ]] || return 1
+  local pid; pid=$(cat "$WATCH_PID_FILE" 2>/dev/null || echo "")
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_watch() {
+  local action="${1:-status}"
+  case "$action" in
+    start)
+      if watch_running; then
+        echo "already running (pid $(cat "$WATCH_PID_FILE"))"
+        return 0
+      fi
+      local bin
+      bin=$(command -v codex-acct-watch || true)
+      [[ -n "$bin" ]] || die "codex-acct-watch not found on PATH"
+      nohup "$bin" >>"$WATCH_LOG_FILE" 2>&1 &
+      echo $! > "$WATCH_PID_FILE"
+      chmod 600 "$WATCH_PID_FILE"
+      echo "started (pid $(cat "$WATCH_PID_FILE"))"
+      ;;
+    stop)
+      if ! watch_running; then
+        rm -f "$WATCH_PID_FILE"
+        echo "not running"
+        return 0
+      fi
+      local pid; pid=$(cat "$WATCH_PID_FILE")
+      kill "$pid" 2>/dev/null || true
+      rm -f "$WATCH_PID_FILE"
+      echo "stopped (pid $pid)"
+      ;;
+    status)
+      if watch_running; then
+        echo "running (pid $(cat "$WATCH_PID_FILE"))"
+      else
+        echo "not running"
+      fi
+      ;;
+    *)
+      die "usage: codex-acct watch {start|stop|status}"
+      ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
@@ -259,6 +308,9 @@ codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
   codex-acct primary <name>          mark <name> as the macbook-paired account
   codex-acct restore                 swap back to the previous account
   codex-acct rm   <name>             delete a saved account
+  codex-acct watch {start|stop|status}
+                                     background daemon that mirrors auth.json
+                                     into the active slot on every change
 
 Storage: $ACCTS  (mode 0600)
 EOF
@@ -276,6 +328,7 @@ case "$sub" in
   primary) cmd_primary "$@" ;;
   restore) cmd_restore "$@" ;;
   rm|remove|delete) cmd_rm "$@" ;;
+  watch) cmd_watch "$@" ;;
   ""|-h|--help|help) usage ;;
   *) cmd_run_codex "$sub" "$@" ;;
 esac
