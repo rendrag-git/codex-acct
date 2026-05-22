@@ -9,6 +9,7 @@ PRIMARY_FILE="$ACCTS/.primary"
 ACTIVE_FILE="$ACCTS/.active"
 PREV_NAME="_previous"
 LOCK_DIR="$CODEX_DIR/.codex-acct.lock"
+DAEMON_SOCK="$CODEX_DIR/app-server-control/app-server-control.sock"
 LOCK_HELD=0
 SYNCED_SLOT=""
 SYNC_NOTE=""
@@ -54,6 +55,71 @@ with_lock() {
   release_lock
   trap - EXIT INT TERM
   return "$rc"
+}
+
+daemon_running() {
+  [[ -S "$DAEMON_SOCK" ]] || return 1
+  # Socket file can outlive the daemon — confirm via a control RPC.
+  codex app-server daemon version >/dev/null 2>&1
+}
+
+daemon_listener_pid() {
+  # PID holding the listening end of the control socket.
+  local pid
+  pid=$(ss -xpl 2>/dev/null | grep -F "$DAEMON_SOCK" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  if [[ -z "$pid" ]]; then
+    # Fallback: pgrep the daemon argv (Rust binary, not the proxy shim).
+    pid=$(pgrep -f 'codex app-server --listen unix://' | head -1)
+  fi
+  echo "$pid"
+}
+
+restart_daemon() {
+  daemon_running || return 0
+  echo "restarting codex app-server daemon (in-memory auth cache reload)..."
+
+  # Path 1: daemon is managed — supported API does a clean restart.
+  if codex app-server daemon restart >/dev/null 2>&1; then
+    echo "daemon restarted."
+    return 0
+  fi
+
+  # Path 2: daemon is unmanaged. Bootstrap managed lifecycle (idempotent), then replace the
+  # listener so the next process is owned by `daemon start`. From this swap onwards, Path 1
+  # should work for future switches.
+  echo "adopting unmanaged daemon under managed lifecycle..."
+  codex app-server daemon bootstrap >/dev/null 2>&1 || true
+
+  local listener_pid parent_pid
+  listener_pid=$(daemon_listener_pid)
+  if [[ -z "$listener_pid" ]]; then
+    echo "warning: daemon is running but listener PID could not be located — restart it manually." >&2
+    return 0
+  fi
+  parent_pid=$(ps -o ppid= -p "$listener_pid" 2>/dev/null | tr -d ' ')
+  echo "stopping unmanaged daemon (pid $listener_pid${parent_pid:+, parent $parent_pid})..."
+  [[ -n "$parent_pid" && "$parent_pid" != "1" ]] && kill "$parent_pid" 2>/dev/null || true
+  kill "$listener_pid" 2>/dev/null || true
+
+  # Wait for the old listener to exit. The codex CLI may auto-respawn a fresh daemon — fine,
+  # the new process reads auth.json at startup and so picks up the swap we just performed.
+  local waited=0
+  while kill -0 "$listener_pid" 2>/dev/null && (( waited < 50 )); do
+    sleep 0.1
+    (( waited += 1 ))
+  done
+  if [[ -S "$DAEMON_SOCK" ]] && [[ -z "$(daemon_listener_pid)" ]]; then
+    rm -f "$DAEMON_SOCK"
+  fi
+
+  # Idempotent: returns "alreadyRunning" exit 0 if a respawn beat us to it.
+  codex app-server daemon start >/dev/null 2>&1 || true
+
+  if daemon_running; then
+    echo "daemon restarted."
+  else
+    echo "warning: daemon did not come back up — start it manually so codex can reauthenticate." >&2
+  fi
 }
 
 slot_path() {
@@ -236,6 +302,16 @@ cmd_save() {
 }
 
 cmd_use() {
+  local restart=1
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --no-daemon-restart) restart=0 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+
   require_name "${1:-}" use
   local name="$1"
   local src="$ACCTS/$name.json"
@@ -259,11 +335,22 @@ cmd_use() {
   copy_auth_atomic "$src" "$AUTH"
 
   write_active_name "$name"
+  (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
   echo "now using: $name  ($email, $plan)"
 }
 
 cmd_add() {
+  local restart=1
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --no-daemon-restart) restart=0 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+
   require_name "${1:-}" add
   local name="$1"
   local dest="$ACCTS/$name.json"
@@ -290,6 +377,7 @@ cmd_add() {
   [[ -f "$AUTH" ]] || die "login did not produce $AUTH"
   copy_auth_atomic "$AUTH" "$dest"
   write_active_name "$name"
+  (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
   echo "added & active: $name  ($email, $plan)"
 }
@@ -304,6 +392,16 @@ cmd_primary() {
 }
 
 cmd_restore() {
+  local restart=1
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --no-daemon-restart) restart=0 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+
   local src="$ACCTS/$PREV_NAME.json"
   [[ -f "$src" ]] || die "no previous account snapshot to restore"
   # Save live state back to its named slot first (freshness)
@@ -320,6 +418,7 @@ cmd_restore() {
   if [[ -n "$matched" ]]; then write_active_name "$matched"
   else rm -f "$ACTIVE_FILE"
   fi
+  (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
   echo "restored previous: ($email, $plan)${matched:+  [active slot: $matched]}"
 }
@@ -409,12 +508,19 @@ codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
   codex-acct who                     show current account
   codex-acct list                    list saved accounts
   codex-acct save <name> [--force]   snapshot current auth.json as <name>
-  codex-acct use  <name>             switch to saved <name> (atomic swap)
-  codex-acct add  <name>             run codex login, save result as <name>
+  codex-acct use  <name> [--no-daemon-restart]
+                                     switch to saved <name> (atomic swap +
+                                     restart of the codex app-server daemon so
+                                     codex re-reads auth)
+  codex-acct add  <name> [--no-daemon-restart]
+                                     run codex login, save result as <name>
+                                     (also restarts the app-server daemon)
   codex-acct sync                    persist live auth.json into the active slot
   codex-acct codex [args...]         run codex, then save any rotated tokens on exit
   codex-acct primary <name>          mark <name> as the macbook-paired account
-  codex-acct restore                 swap back to the previous account
+  codex-acct restore [--no-daemon-restart]
+                                     swap back to the previous account
+                                     (also restarts the app-server daemon)
   codex-acct rm   <name>             delete a saved account
   codex-acct watch {start|stop|status}
                                      background daemon that mirrors auth.json
