@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
 # codex-acct-watch — poll ~/.codex/auth.json and mirror it into the active
-# slot whenever it changes. Pure bash, portable across Linux + macOS.
+# slot whenever it changes; also re-assert the managed codex wrapper if an
+# npm codex update clobbers it. Pure bash, portable across Linux + macOS.
 set -euo pipefail
 
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 AUTH="$CODEX_DIR/auth.json"
 INTERVAL="${CODEX_ACCT_WATCH_INTERVAL:-3}"
+WRAPPER="${CODEX_ACCT_CODEX_WRAPPER:-$HOME/.local/bin/codex}"
+# Seconds a bad wrapper must persist before repair — long enough for an
+# in-flight `npm install -g` (which removes and recreates bin links) to finish.
+REPAIR_DEBOUNCE="${CODEX_ACCT_WATCH_REPAIR_DEBOUNCE:-10}"
 
 get_mtime() {
   # GNU stat first, fall back to BSD stat (macOS).
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
+wrapper_healthy() {
+  head -5 "$WRAPPER" 2>/dev/null | grep -qx '# codex-acct managed wrapper'
+}
+
 last=0
+# Epoch when the wrapper was first seen unhealthy; 0 while healthy. Time-based
+# (not mtime-based) because the clobbered path may be a symlink or missing.
+first_bad=0
 while :; do
   if [[ -f "$AUTH" ]]; then
     cur=$(get_mtime "$AUTH")
@@ -21,5 +33,25 @@ while :; do
       last="$cur"
     fi
   fi
+
+  if wrapper_healthy; then
+    first_bad=0
+  else
+    now=$(date +%s)
+    if (( first_bad == 0 )); then
+      first_bad=$now
+    elif (( now - first_bad >= REPAIR_DEBOUNCE )); then
+      if codex-acct repair-wrapper --quiet; then
+        echo "$(date -u +%FT%TZ) repaired clobbered codex wrapper: $WRAPPER" >&2
+        first_bad=0
+      else
+        # Repair refused (unknown file) or failed; log and retry after another
+        # full debounce window instead of hammering every poll.
+        echo "$(date -u +%FT%TZ) wrapper unhealthy and repair failed: $WRAPPER" >&2
+        first_bad=$now
+      fi
+    fi
+  fi
+
   sleep "$INTERVAL"
 done

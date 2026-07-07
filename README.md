@@ -49,6 +49,21 @@ After that, use normal `codex` commands. The wrapper is reversible with
 launch yourself; the watcher additionally catches refreshes from the desktop app
 and other sessions, so the two are complementary.
 
+### Surviving codex updates
+
+`npm install -g @openai/codex` — whether typed by hand, run by the Codex TUI's
+"Update now" prompt, or by `codex update` — replaces `~/.local/bin/codex` with
+the stock npm symlink, silently removing the managed wrapper (npm's update path
+does not check ownership of existing bin entries). Two defenses:
+
+- The watcher also monitors the wrapper and re-asserts it automatically about
+  ten seconds after a clobber (debounced so it never races a mid-flight npm
+  install). `codex-acct repair-wrapper` is the same reconciler by hand: no-op
+  when healthy, repairs only the recognizable clobber shapes (stock npm symlink
+  or missing file), and fails closed on anything it doesn't recognize.
+- `codex-acct update` updates the npm package and immediately repairs the
+  wrapper in one step — prefer it over calling npm directly.
+
 ## Usage
 
 ```sh
@@ -66,6 +81,8 @@ codex-acct provider use openai # switch config.toml back to default OpenAI provi
 codex-acct primary personal    # mark the account paired with a ChatGPT app (warns if you leave it)
 codex-acct codex [args...]     # run `codex`, then sync rotated tokens back into the active slot
 codex-acct install-wrapper     # make plain `codex` run through codex-acct
+codex-acct repair-wrapper      # re-assert the wrapper after an npm codex update clobbered it
+codex-acct update              # npm install -g @openai/codex + repair-wrapper
 codex-acct watch start|stop|status   # background watcher, see "Keep tokens fresh"
 ```
 

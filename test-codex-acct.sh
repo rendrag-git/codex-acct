@@ -412,6 +412,113 @@ TOML
   fi
 }
 
+test_repair_wrapper_restores_clobbered_npm_symlink() {
+  setup_home repair-clobbered
+  local bin_dir="$TEST_ROOT/repair-bin"
+  local pkg_bin="$bin_dir/lib/node_modules/@openai/codex/bin/codex.js"
+  mkdir -p "$(dirname "$pkg_bin")" "$bin_dir"
+  printf '#!/usr/bin/env bash\necho real-codex\n' > "$pkg_bin"
+  chmod +x "$pkg_bin"
+  # The post-`npm install -g` crime scene: stock symlink at the wrapper path,
+  # and a dangling real-slot symlink left over from before the update.
+  ln -s "$pkg_bin" "$bin_dir/codex"
+  ln -s "$bin_dir/gone-codex.js" "$bin_dir/codex.codex-acct-real"
+
+  CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" repair-wrapper >/dev/null
+
+  if ! head -5 "$bin_dir/codex" | grep -qx '# codex-acct managed wrapper'; then
+    echo "FAIL: repair-wrapper should reinstate the managed wrapper" >&2
+    exit 1
+  fi
+  assert_eq "$pkg_bin" "$(readlink "$bin_dir/codex.codex-acct-real")" "repair relinked the real slot to the npm bin script"
+}
+
+test_repair_wrapper_is_noop_when_healthy() {
+  setup_home repair-noop
+  local bin_dir="$TEST_ROOT/repair-noop-bin"
+  mkdir -p "$bin_dir"
+  printf '#!/usr/bin/env bash\necho real-codex\n' > "$bin_dir/codex"
+  chmod +x "$bin_dir/codex"
+  CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" install-wrapper >/dev/null
+  cp "$bin_dir/codex" "$bin_dir/codex.before"
+
+  CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" repair-wrapper --quiet
+
+  if ! cmp -s "$bin_dir/codex" "$bin_dir/codex.before"; then
+    echo "FAIL: repair-wrapper must not rewrite a healthy wrapper" >&2
+    exit 1
+  fi
+}
+
+test_repair_wrapper_refuses_unknown_file() {
+  setup_home repair-unknown
+  local bin_dir="$TEST_ROOT/repair-unknown-bin"
+  mkdir -p "$bin_dir"
+  printf '#!/usr/bin/env bash\necho some other tool entirely\n' > "$bin_dir/codex"
+  chmod +x "$bin_dir/codex"
+  cp "$bin_dir/codex" "$bin_dir/codex.before"
+
+  if CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" repair-wrapper >/dev/null 2>&1; then
+    echo "FAIL: repair-wrapper must fail closed on an unrecognized file" >&2
+    exit 1
+  fi
+  if ! cmp -s "$bin_dir/codex" "$bin_dir/codex.before"; then
+    echo "FAIL: repair-wrapper must not modify an unrecognized file" >&2
+    exit 1
+  fi
+  if [[ -e "$bin_dir/codex.codex-acct-real" || -L "$bin_dir/codex.codex-acct-real" ]]; then
+    echo "FAIL: repair-wrapper must not create a real slot when refusing" >&2
+    exit 1
+  fi
+}
+
+test_update_runs_npm_then_repairs_wrapper() {
+  setup_home update-repairs
+  local bin_dir="$TEST_ROOT/update-bin"
+  local pkg_bin="$bin_dir/lib/node_modules/@openai/codex/bin/codex.js"
+  mkdir -p "$(dirname "$pkg_bin")" "$bin_dir"
+  printf '#!/usr/bin/env bash\necho real-codex\n' > "$pkg_bin"
+  chmod +x "$pkg_bin"
+  printf '#!/usr/bin/env bash\necho managed\n' > "$bin_dir/codex"
+  chmod +x "$bin_dir/codex"
+  CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" install-wrapper >/dev/null
+  # Fake npm: logs the invocation and clobbers the wrapper with the stock
+  # symlink, exactly like the real update path does.
+  local fake_bin="$TEST_ROOT/update-fake-npm"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/npm" <<SH
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "prefix" ]]; then echo "$bin_dir"; exit 0; fi
+echo "npm \$*" >> "$CODEX_HOME/npm-commands"
+ln -sfn "$pkg_bin" "$bin_dir/codex"
+SH
+  chmod +x "$fake_bin/npm"
+
+  PATH="$fake_bin:$PATH" \
+    CODEX_ACCT_CODEX_WRAPPER="$bin_dir/codex" \
+    CODEX_ACCT_REAL_CODEX="$bin_dir/codex.codex-acct-real" \
+    "$ROOT/codex-acct" update >/dev/null
+
+  if ! grep -q '^npm install -g @openai/codex$' "$CODEX_HOME/npm-commands"; then
+    echo "FAIL: update should run npm install -g @openai/codex" >&2
+    exit 1
+  fi
+  if ! head -5 "$bin_dir/codex" | grep -qx '# codex-acct managed wrapper'; then
+    echo "FAIL: update should re-assert the managed wrapper after npm clobbers it" >&2
+    exit 1
+  fi
+}
+
 test_list_shows_odin_as_virtual_slot() {
   setup_home provider-list
   cp "$CODEX_HOME/accounts/personal.json" "$CODEX_HOME/auth.json"
@@ -557,6 +664,10 @@ test_use_odin_reads_default_env_file_without_outer_op_run
 test_codex_run_loads_odin_env_before_launch
 test_codex_run_resolves_1password_env_refs_before_launch
 test_install_wrapper_routes_plain_codex_through_switcher
+test_repair_wrapper_restores_clobbered_npm_symlink
+test_repair_wrapper_is_noop_when_healthy
+test_repair_wrapper_refuses_unknown_file
+test_update_runs_npm_then_repairs_wrapper
 test_list_shows_odin_as_virtual_slot
 test_use_real_account_leaves_normal_provider_unchanged
 test_use_real_account_after_odin_restores_normal_provider

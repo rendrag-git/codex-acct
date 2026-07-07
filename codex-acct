@@ -957,11 +957,38 @@ cmd_run_codex() {
   return "$rc"
 }
 
+# Write the managed wrapper at $CODEX_WRAPPER pointing at real binary $1.
+# Atomic: temp file in the same directory, then mv — a concurrent `codex` sees
+# either the old entry or the finished wrapper, never a half-written script.
+write_managed_wrapper() {
+  local real="$1" self tmp
+  self=$(script_path)
+  tmp=$(mktemp "$(dirname "$CODEX_WRAPPER")/.codex-acct-wrapper.XXXXXX")
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# codex-acct managed wrapper'
+    echo 'set -euo pipefail'
+    printf 'export CODEX_ACCT_REAL_CODEX=%s\n' "$(shell_quote "$real")"
+    printf 'exec %s codex "$@"\n' "$(shell_quote "$self")"
+  } > "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$CODEX_WRAPPER"
+}
+
+# True when the wrapper path holds the stock symlink npm creates for the
+# @openai/codex bin entry — the one shape (besides absence) repair may replace.
+wrapper_is_npm_stock() {
+  [[ -L "$CODEX_WRAPPER" ]] || return 1
+  case "$(readlink "$CODEX_WRAPPER")" in
+    */node_modules/@openai/codex/bin/codex.js) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_install_wrapper() {
   [[ $# -eq 0 ]] || die "usage: codex-acct install-wrapper"
   mkdir -p "$(dirname "$CODEX_WRAPPER")"
-  local self tmp real
-  self=$(script_path)
+  local real
   real="$CODEX_REAL"
 
   if [[ "$CODEX_WRAPPER" == "$real" ]]; then
@@ -983,18 +1010,76 @@ cmd_install_wrapper() {
 
   [[ -x "$real" ]] || die "real codex is not executable: $real"
 
-  tmp=$(mktemp "$(dirname "$CODEX_WRAPPER")/.codex-acct-wrapper.XXXXXX")
-  {
-    echo '#!/usr/bin/env bash'
-    echo '# codex-acct managed wrapper'
-    echo 'set -euo pipefail'
-    printf 'export CODEX_ACCT_REAL_CODEX=%s\n' "$(shell_quote "$real")"
-    printf 'exec %s codex "$@"\n' "$(shell_quote "$self")"
-  } > "$tmp"
-  chmod 755 "$tmp"
-  mv -f "$tmp" "$CODEX_WRAPPER"
+  write_managed_wrapper "$real"
   echo "installed codex wrapper: $CODEX_WRAPPER -> codex-acct codex"
   echo "real codex: $real"
+}
+
+# Reconcile the wrapper after something (typically `npm install -g @openai/codex`,
+# which npm's update path lets silently replace foreign files at the bin path)
+# clobbered it. Conservative on purpose: only the two recognizable clobber shapes
+# are repaired — the stock npm symlink and a missing file. Anything else at the
+# wrapper path fails closed so an unknown tool's file is never destroyed.
+# Idempotent and cheap when healthy; safe to call from the watcher every poll.
+cmd_repair_wrapper() {
+  local quiet=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet|-q) quiet=1; shift ;;
+      *) die "usage: codex-acct repair-wrapper [--quiet]" ;;
+    esac
+  done
+  local real="$CODEX_REAL"
+
+  if is_managed_codex_wrapper "$CODEX_WRAPPER"; then
+    [[ -x "$real" ]] || die "wrapper is managed but real codex is missing: $real"
+    (( quiet )) || echo "wrapper ok: $CODEX_WRAPPER"
+    return 0
+  fi
+
+  if [[ -e "$CODEX_WRAPPER" || -L "$CODEX_WRAPPER" ]]; then
+    wrapper_is_npm_stock \
+      || die "refusing to repair: unexpected file at $CODEX_WRAPPER (not the managed wrapper or the stock npm symlink)"
+  fi
+
+  # Make the real slot valid before touching the wrapper path. A dangling real
+  # symlink (package dir replaced mid-update) is dead weight — replace it.
+  if [[ -L "$real" && ! -e "$real" ]]; then
+    rm -f "$real"
+  fi
+  if [[ ! -e "$real" && ! -L "$real" ]]; then
+    if wrapper_is_npm_stock; then
+      mv "$CODEX_WRAPPER" "$real"
+    else
+      # Wrapper path is empty too; fall back to the npm package's bin script.
+      local pkg_bin
+      pkg_bin="$(npm_codex_bin)" || die "cannot repair: no real codex found (npm package missing?)"
+      ln -s "$pkg_bin" "$real"
+    fi
+  fi
+  [[ -x "$real" ]] || die "cannot repair: real codex is not executable: $real"
+
+  write_managed_wrapper "$real"
+  (( quiet )) || echo "repaired codex wrapper: $CODEX_WRAPPER -> codex-acct codex"
+}
+
+# Locate the npm-installed codex bin script without consulting PATH (the wrapper
+# path itself may be the only PATH hit and could be anything mid-repair).
+npm_codex_bin() {
+  local prefix candidate
+  prefix=$(npm prefix -g 2>/dev/null) || return 1
+  candidate="$prefix/lib/node_modules/@openai/codex/bin/codex.js"
+  [[ -e "$candidate" ]] || candidate="$prefix/node_modules/@openai/codex/bin/codex.js"
+  [[ -e "$candidate" ]] || return 1
+  echo "$candidate"
+}
+
+# Update the npm package, then immediately re-assert the wrapper npm just
+# clobbered. The habit-friendly replacement for `npm install -g @openai/codex`.
+cmd_update() {
+  [[ $# -eq 0 ]] || die "usage: codex-acct update"
+  npm install -g @openai/codex || die "npm install -g @openai/codex failed"
+  cmd_repair_wrapper
 }
 
 cmd_uninstall_wrapper() {
@@ -1086,6 +1171,11 @@ codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
   codex-acct codex [args...]         run codex, then save any rotated tokens on exit
   codex-acct install-wrapper         make plain 'codex' run through codex-acct
   codex-acct uninstall-wrapper       restore the original plain 'codex' launcher
+  codex-acct repair-wrapper [--quiet]
+                                     re-assert the managed wrapper after an npm
+                                     codex update clobbered it (no-op when healthy;
+                                     refuses to touch unrecognized files)
+  codex-acct update                  npm install -g @openai/codex + repair-wrapper
   codex-acct provider status         show active model provider from config.toml
   codex-acct provider use odin [--base-url URL] [--model MODEL]
                                      explicit form of: use odin
@@ -1117,6 +1207,8 @@ case "$sub" in
   codex|run) cmd_run_codex "$@" ;;
   install-wrapper|install-codex-wrapper) cmd_install_wrapper "$@" ;;
   uninstall-wrapper|uninstall-codex-wrapper) cmd_uninstall_wrapper "$@" ;;
+  repair-wrapper) with_lock cmd_repair_wrapper "$@" ;;
+  update) with_lock cmd_update "$@" ;;
   provider) with_lock cmd_provider "$@" ;;
   odin) with_lock cmd_provider_use odin "$@" ;;
   openai) with_lock cmd_provider_use openai "$@" ;;
