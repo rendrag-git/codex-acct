@@ -33,15 +33,21 @@ command -v codex-acct >/dev/null && codex-acct watch start >/dev/null 2>&1 || tr
 
 Polling interval defaults to 3 s — override with `CODEX_ACCT_WATCH_INTERVAL=<seconds>` in your shell rc. Works on Linux and macOS (pure bash, no dependencies).
 
-### Or sync on exit via a shell alias
+### Or sync on exit via the Codex launcher wrapper
 
-Instead of (or alongside) the watcher, route every `codex` invocation through `codex-acct`. It runs the real `codex` and, on exit, syncs any rotated tokens back into the active slot:
+Instead of (or alongside) the watcher, route every `codex` invocation through
+`codex-acct`. It keeps the original Codex CLI as `codex.codex-acct-real`, writes
+a small managed wrapper at `~/.local/bin/codex`, and syncs any rotated tokens
+back into the active slot on exit:
 
 ```sh
-alias codex='codex-acct codex'
+codex-acct install-wrapper
 ```
 
-Add it to `~/.bashrc` or `~/.zshrc`. Because the alias makes `codex` resolve to `codex-acct codex`, and `codex-acct` in turn invokes the real `codex` from your `PATH`, make sure a working Codex CLI is installed and ahead of any stale copy on your `PATH` (aliases don't expand inside the script, so this does not recurse). Note this only captures refreshes from runs you launch yourself — the watcher additionally catches refreshes from the desktop app and other sessions, so the two are complementary.
+After that, use normal `codex` commands. The wrapper is reversible with
+`codex-acct uninstall-wrapper`. This only captures refreshes from runs you
+launch yourself; the watcher additionally catches refreshes from the desktop app
+and other sessions, so the two are complementary.
 
 ## Usage
 
@@ -50,11 +56,16 @@ codex-acct add personal        # runs `codex login` without revoking the current
 codex-acct add work            # log in to a second account, save as "work"
 codex-acct use personal        # atomic swap, then restart the app-server daemon
 codex-acct use work --no-daemon-restart   # swap without bouncing the daemon
+codex-acct use odin            # switch to the Odin Responses provider slot
 codex-acct list                # show all saved accounts + which is active
 codex-acct who                 # show the active account (email, plan, account_id)
 codex-acct restore             # swap back to the previous account
+codex-acct provider status     # show active model provider from ~/.codex/config.toml
+codex-acct provider use odin   # explicit form of: codex-acct use odin
+codex-acct provider use openai # switch config.toml back to default OpenAI provider
 codex-acct primary personal    # mark the account paired with a ChatGPT app (warns if you leave it)
 codex-acct codex [args...]     # run `codex`, then sync rotated tokens back into the active slot
+codex-acct install-wrapper     # make plain `codex` run through codex-acct
 codex-acct watch start|stop|status   # background watcher, see "Keep tokens fresh"
 ```
 
@@ -63,6 +74,23 @@ Existing logins can be captured without re-authenticating:
 ```sh
 codex login                    # if you don't already have a session
 codex-acct save personal       # snapshot the current ~/.codex/auth.json
+```
+
+`odin` is a virtual slot because it needs a different Codex provider block than
+normal ChatGPT/Codex accounts. Switching to `odin` edits only the top-level
+`model` / `model_provider` settings and the `[model_providers.odin]` block in
+`~/.codex/config.toml`; it does not rewrite `auth.json` or the saved account
+slots. Switching back to any real saved account restores the normal provider
+config if the current provider is Odin. The switcher loads
+`~/projects/odin/.env.1password` automatically when Odin is active, exports the
+resolved Odin variables for the child Codex process, and then launches the real
+Codex binary directly so interactive terminal stdio stays intact. Override the
+env path with `CODEX_ACCT_ODIN_ENV_FILE=/path/to/.env.1password` if needed:
+
+```sh
+codex-acct use odin
+
+codex exec "Reply exactly: codex odin ok"
 ```
 
 ## Switching restarts the app-server daemon

@@ -4,10 +4,16 @@ set -euo pipefail
 
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 AUTH="$CODEX_DIR/auth.json"
+CONFIG="$CODEX_DIR/config.toml"
 ACCTS="$CODEX_DIR/accounts"
+PROVIDERS="$CODEX_DIR/providers"
 PRIMARY_FILE="$ACCTS/.primary"
 ACTIVE_FILE="$ACCTS/.active"
+ACTIVE_PROVIDER_FILE="$PROVIDERS/.active"
 PREV_NAME="_previous"
+ODIN_ENV_FILE_DEFAULT="$HOME/projects/odin/.env.1password"
+CODEX_WRAPPER="${CODEX_ACCT_CODEX_WRAPPER:-$HOME/.local/bin/codex}"
+CODEX_REAL="${CODEX_ACCT_REAL_CODEX:-$HOME/.local/bin/codex.codex-acct-real}"
 LOCK_DIR="$CODEX_DIR/.codex-acct.lock"
 DAEMON_SOCK="$CODEX_DIR/app-server-control/app-server-control.sock"
 LOCK_HELD=0
@@ -16,8 +22,59 @@ SYNC_NOTE=""
 
 mkdir -p "$ACCTS"
 chmod 700 "$ACCTS"
+mkdir -p "$PROVIDERS"
+chmod 700 "$PROVIDERS"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+script_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "${BASH_SOURCE[0]}"
+  else
+    python3 - "${BASH_SOURCE[0]}" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+  fi
+}
+
+is_managed_codex_wrapper() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  head -5 "$path" 2>/dev/null | grep -qx '# codex-acct managed wrapper'
+}
+
+real_codex_bin() {
+  if [[ -n "${CODEX_ACCT_REAL_CODEX:-}" ]]; then
+    [[ -x "$CODEX_ACCT_REAL_CODEX" ]] || die "CODEX_ACCT_REAL_CODEX is not executable: $CODEX_ACCT_REAL_CODEX"
+    echo "$CODEX_ACCT_REAL_CODEX"
+    return 0
+  fi
+
+  local candidate
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if is_managed_codex_wrapper "$candidate"; then
+      continue
+    fi
+    [[ -x "$candidate" ]] || continue
+    echo "$candidate"
+    return 0
+  done < <(type -aP codex 2>/dev/null | awk '!seen[$0]++')
+
+  if [[ -x "$CODEX_REAL" ]]; then
+    echo "$CODEX_REAL"
+    return 0
+  fi
+
+  die "real codex binary not found on PATH"
+}
 
 release_lock() {
   if [[ "$LOCK_HELD" == "1" ]]; then
@@ -60,7 +117,10 @@ with_lock() {
 daemon_running() {
   [[ -S "$DAEMON_SOCK" ]] || return 1
   # Socket file can outlive the daemon — confirm via a control RPC.
-  codex app-server daemon version >/dev/null 2>&1
+  # Use the real codex binary directly (not the managed 'codex' shim): restart_daemon
+  # runs while the codex-acct switch lock is held, and going through the shim would
+  # re-enter codex-acct (cmd_run_codex -> with_lock) and deadlock on that same lock.
+  "$(real_codex_bin)" app-server daemon version >/dev/null 2>&1
 }
 
 daemon_listener_pid() {
@@ -74,51 +134,79 @@ daemon_listener_pid() {
   echo "$pid"
 }
 
-restart_daemon() {
-  daemon_running || return 0
-  echo "restarting codex app-server daemon (in-memory auth cache reload)..."
-
-  # Path 1: daemon is managed — supported API does a clean restart.
-  if codex app-server daemon restart >/dev/null 2>&1; then
-    echo "daemon restarted."
-    return 0
+# Load the environment the fresh daemon must carry for the *currently configured*
+# provider. Every switch path writes config.toml to the target provider before calling
+# restart_daemon, so we key off config_provider() here. Odin needs ODIN_GATEWAY_TOKEN in
+# the daemon's own environment — it is read at request time in the daemon process
+# (model-provider-info/src/lib.rs), NOT in the TUI client — so exporting it into the
+# launching shell only helps if the daemon we spawn inherits it. ChatGPT/OpenAI needs the
+# var absent so a stale token never leaks into an OpenAI-backed daemon.
+set_daemon_env_for_active_provider() {
+  if [[ "$(config_provider)" == "odin" ]]; then
+    load_odin_env_for_child
+  else
+    unset ODIN_GATEWAY_TOKEN ODIN_GATEWAY_BASE_URL ODIN_GATEWAY_MODEL 2>/dev/null || true
   fi
+}
 
-  # Path 2: daemon is unmanaged. Bootstrap managed lifecycle (idempotent), then replace the
-  # listener so the next process is owned by `daemon start`. From this swap onwards, Path 1
-  # should work for future switches.
-  echo "adopting unmanaged daemon under managed lifecycle..."
-  codex app-server daemon bootstrap >/dev/null 2>&1 || true
-
-  local listener_pid parent_pid
+# Stop the current daemon listener (and its immediate parent) and drop the stale socket.
+stop_daemon() {
+  local listener_pid parent_pid waited=0
   listener_pid=$(daemon_listener_pid)
-  if [[ -z "$listener_pid" ]]; then
-    echo "warning: daemon is running but listener PID could not be located — restart it manually." >&2
-    return 0
+  if [[ -n "$listener_pid" ]]; then
+    parent_pid=$(ps -o ppid= -p "$listener_pid" 2>/dev/null | tr -d ' ')
+    [[ -n "$parent_pid" && "$parent_pid" != "1" ]] && kill "$parent_pid" 2>/dev/null || true
+    kill "$listener_pid" 2>/dev/null || true
+    while kill -0 "$listener_pid" 2>/dev/null && (( waited < 50 )); do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
   fi
-  parent_pid=$(ps -o ppid= -p "$listener_pid" 2>/dev/null | tr -d ' ')
-  echo "stopping unmanaged daemon (pid $listener_pid${parent_pid:+, parent $parent_pid})..."
-  [[ -n "$parent_pid" && "$parent_pid" != "1" ]] && kill "$parent_pid" 2>/dev/null || true
-  kill "$listener_pid" 2>/dev/null || true
+  # Sweep any lingering listener bound to our socket, then remove the stale socket file.
+  pkill -f "app-server --listen unix://$DAEMON_SOCK" 2>/dev/null || true
+  [[ -S "$DAEMON_SOCK" ]] && rm -f "$DAEMON_SOCK"
+  return 0
+}
 
-  # Wait for the old listener to exit. The codex CLI may auto-respawn a fresh daemon — fine,
-  # the new process reads auth.json at startup and so picks up the swap we just performed.
-  local waited=0
-  while kill -0 "$listener_pid" 2>/dev/null && (( waited < 50 )); do
-    sleep 0.1
-    (( waited += 1 ))
+# Spawn a fresh, detached app-server listener that inherits the current environment.
+# We deliberately bypass `codex app-server daemon start` (the "managed" path): it needs a
+# standalone install that isn't present here, and where it does exist it restarts via an
+# RPC to the *running* daemon, so the new process would inherit the OLD daemon's env
+# instead of the token we just exported. A direct `--listen` spawn is exactly how an
+# unmanaged daemon already runs, and it inherits this shell's env at fork.
+spawn_daemon() {
+  local codex_bin waited=0
+  codex_bin=$(real_codex_bin) || return 1
+  mkdir -p "$(dirname "$DAEMON_SOCK")"
+  setsid "$codex_bin" app-server --listen "unix://$DAEMON_SOCK" \
+    >>"$(dirname "$DAEMON_SOCK")/app-server.log" 2>&1 </dev/null &
+  disown 2>/dev/null || true
+  while ! daemon_running && (( waited < 25 )); do
+    sleep 0.4
+    waited=$((waited + 1))
   done
-  if [[ -S "$DAEMON_SOCK" ]] && [[ -z "$(daemon_listener_pid)" ]]; then
-    rm -f "$DAEMON_SOCK"
+  daemon_running
+}
+
+restart_daemon() {
+  local provider
+  provider=$(config_provider)
+  echo "restarting codex app-server daemon (provider=$provider)..."
+  # Order matters: config.toml is already on the target provider, so resolve the daemon
+  # env for it, tear the old daemon down, then bring up a replacement carrying that env.
+  set_daemon_env_for_active_provider
+  # Test seam: when an override manager is provided, delegate the real process lifecycle
+  # to it (so the suite can assert intent — which provider, whether a token was resolved —
+  # without spawning a real app-server) and skip the live kill/spawn.
+  if [[ -n "${CODEX_ACCT_DAEMON_MANAGER:-}" ]]; then
+    "$CODEX_ACCT_DAEMON_MANAGER" "$provider" "${ODIN_GATEWAY_TOKEN:-}"
+    return $?
   fi
-
-  # Idempotent: returns "alreadyRunning" exit 0 if a respawn beat us to it.
-  codex app-server daemon start >/dev/null 2>&1 || true
-
-  if daemon_running; then
+  stop_daemon
+  if spawn_daemon; then
     echo "daemon restarted."
   else
-    echo "warning: daemon did not come back up — start it manually so codex can reauthenticate." >&2
+    echo "warning: daemon did not come back up — start it manually so codex can (re)authenticate." >&2
   fi
 }
 
@@ -238,8 +326,403 @@ auth_matches() {
 }
 active_name() { [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || echo ""; }
 primary_name() { [[ -f "$PRIMARY_FILE" ]] && cat "$PRIMARY_FILE" || echo ""; }
+active_provider_name() { [[ -f "$ACTIVE_PROVIDER_FILE" ]] && cat "$ACTIVE_PROVIDER_FILE" || echo ""; }
+
+reserved_provider_name() {
+  [[ "${1:-}" == "odin" ]]
+}
+
+odin_env_file() {
+  if [[ -n "${CODEX_ACCT_ODIN_ENV_FILE:-}" ]]; then
+    echo "$CODEX_ACCT_ODIN_ENV_FILE"
+  elif [[ -f "$ODIN_ENV_FILE_DEFAULT" ]]; then
+    echo "$ODIN_ENV_FILE_DEFAULT"
+  fi
+}
+
+require_op_for_odin_env() {
+  command -v op >/dev/null 2>&1 || die "op CLI is required to load Odin env file; set ODIN_GATEWAY_BASE_URL and ODIN_GATEWAY_TOKEN directly or install op"
+}
+
+read_odin_env_values() {
+  local env_file
+  env_file=$(odin_env_file)
+  [[ -n "$env_file" ]] || return 1
+  [[ -f "$env_file" ]] || die "Odin env file not found: $env_file"
+  local file_values file_base_url file_model file_token base_url model token
+  file_values=$(python3 - "$env_file" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+keys = ("ODIN_GATEWAY_BASE_URL", "ODIN_GATEWAY_MODEL", "ODIN_GATEWAY_TOKEN")
+values = {}
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[len("export "):].lstrip()
+    if "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if key not in keys:
+        continue
+    value = value.strip()
+    if value[:1] in {"'", '"'}:
+        try:
+            parts = shlex.split(value, posix=True)
+            value = parts[0] if parts else ""
+        except ValueError:
+            value = value.strip("'\"")
+    else:
+        value = value.split(" #", 1)[0].strip()
+    values[key] = value
+print("\t".join(values.get(key, "") for key in keys))
+PY
+)
+  IFS=$'\t' read -r file_base_url file_model file_token <<< "$file_values"
+  base_url=$(resolve_odin_env_value "ODIN_GATEWAY_BASE_URL" "${ODIN_GATEWAY_BASE_URL:-${file_base_url:-}}") || return $?
+  model=$(resolve_odin_env_value "ODIN_GATEWAY_MODEL" "${ODIN_GATEWAY_MODEL:-${file_model:-}}") || return $?
+  token=$(resolve_odin_env_value "ODIN_GATEWAY_TOKEN" "${ODIN_GATEWAY_TOKEN:-${file_token:-}}") || return $?
+  printf "%s\t%s\t%s\n" "$base_url" "$model" "$token"
+}
+
+resolve_odin_env_value() {
+  local name="$1" value="$2"
+  if [[ "$value" == op://* ]]; then
+    require_op_for_odin_env
+    op read "$value" || die "failed to resolve $name from 1Password ref"
+    return 0
+  fi
+  printf "%s\n" "$value"
+}
+
+read_odin_env_defaults() {
+  local values base_url model _token
+  values=$(read_odin_env_values) || return 1
+  IFS=$'\t' read -r base_url model _token <<< "$values"
+  printf "%s\t%s\n" "$base_url" "$model"
+}
+
+load_odin_env_for_child() {
+  [[ -n "${ODIN_GATEWAY_TOKEN:-}" ]] && return 0
+  local env_file values base_url model token
+  env_file=$(odin_env_file)
+  [[ -n "$env_file" ]] || die "Odin is active but ODIN_GATEWAY_TOKEN is not set and no Odin env file was found"
+  [[ -f "$env_file" ]] || die "Odin env file not found: $env_file"
+  values=$(read_odin_env_values) || die "failed to load Odin env file: $env_file"
+  IFS=$'\t' read -r base_url model token <<< "$values"
+  [[ -n "$token" ]] || die "Odin env file did not provide ODIN_GATEWAY_TOKEN: $env_file"
+  export ODIN_GATEWAY_TOKEN="$token"
+  [[ -n "$base_url" && -z "${ODIN_GATEWAY_BASE_URL:-}" ]] && export ODIN_GATEWAY_BASE_URL="$base_url"
+  [[ -n "$model" && -z "${ODIN_GATEWAY_MODEL:-}" ]] && export ODIN_GATEWAY_MODEL="$model"
+}
+
+config_provider() {
+  python3 - "$CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("openai")
+    sys.exit(0)
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("openai")
+    sys.exit(0)
+try:
+    data = tomllib.loads(path.read_text())
+except Exception:
+    print("openai")
+    sys.exit(0)
+print(data.get("model_provider") or "openai")
+PY
+}
+
+config_model() {
+  python3 - "$CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("gpt-5.5")
+    sys.exit(0)
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("gpt-5.5")
+    sys.exit(0)
+try:
+    data = tomllib.loads(path.read_text())
+except Exception:
+    print("gpt-5.5")
+    sys.exit(0)
+print(data.get("model") or "gpt-5.5")
+PY
+}
+
+write_active_provider_name() {
+  local name="$1"
+  echo -n "$name" > "$ACTIVE_PROVIDER_FILE"
+  chmod 600 "$ACTIVE_PROVIDER_FILE"
+}
+
+current_odin_base_url() {
+  python3 - "$CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(0)
+
+path = Path(sys.argv[1])
+if not path.exists():
+    sys.exit(0)
+try:
+    data = tomllib.loads(path.read_text())
+except Exception:
+    sys.exit(0)
+url = data.get("model_providers", {}).get("odin", {}).get("base_url", "")
+if url.endswith("/openai/v1"):
+    url = url[: -len("/openai/v1")]
+print(url)
+PY
+}
+
+update_provider_config() {
+  local provider="$1" model="$2" base_url="${3:-}"
+  mkdir -p "$CODEX_DIR"
+  local tmp
+  tmp=$(mktemp "$CODEX_DIR/.config.XXXXXX")
+  python3 - "$CONFIG" "$tmp" "$provider" "$model" "$base_url" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+tmp_path = Path(sys.argv[2])
+provider = sys.argv[3]
+model = sys.argv[4]
+base_url = sys.argv[5]
+
+def toml_string(value: str) -> str:
+    return json.dumps(value)
+
+def normalize_odin_base(url: str) -> str:
+    value = url.rstrip("/")
+    if value.endswith("/responses"):
+        value = value[: -len("/responses")]
+    if value.endswith("/openai/v1"):
+        return value
+    return f"{value}/openai/v1"
+
+text = config_path.read_text() if config_path.exists() else ""
+lines = text.splitlines()
+
+# Replace any existing Odin provider block only when writing a fresh Odin block.
+# Switching back to OpenAI leaves the block in place so the next Odin switch can
+# reuse its base URL without requiring the environment again.
+without_odin = []
+if provider == "odin":
+    skip = False
+    for line in lines:
+        if re.match(r"\s*\[model_providers\.odin\]\s*(?:#.*)?$", line):
+            skip = True
+            continue
+        if skip and re.match(r"\s*\[", line):
+            skip = False
+        if not skip:
+            without_odin.append(line)
+else:
+    without_odin = lines
+
+out = []
+at_top = True
+saw_model = False
+saw_model_provider = False
+
+def emit_missing_top_level() -> None:
+    global saw_model, saw_model_provider
+    if not saw_model:
+        out.append(f"model = {toml_string(model)}")
+        saw_model = True
+    if provider == "odin" and not saw_model_provider:
+        out.append('model_provider = "odin"')
+        saw_model_provider = True
+
+for line in without_odin:
+    if at_top and re.match(r"\s*\[", line):
+        emit_missing_top_level()
+        at_top = False
+        out.append(line)
+        continue
+
+    if at_top and re.match(r"\s*model\s*=", line):
+        out.append(f"model = {toml_string(model)}")
+        saw_model = True
+        continue
+
+    if at_top and re.match(r"\s*model_provider\s*=", line):
+        if provider == "odin":
+            out.append('model_provider = "odin"')
+            saw_model_provider = True
+        continue
+
+    out.append(line)
+
+if at_top:
+    emit_missing_top_level()
+
+if provider == "odin":
+    if not base_url:
+        raise SystemExit("missing Odin base URL")
+    if out and out[-1] != "":
+        out.append("")
+    out.extend(
+        [
+            "[model_providers.odin]",
+            'name = "Odin Gateway"',
+            f"base_url = {toml_string(normalize_odin_base(base_url))}",
+            'env_key = "ODIN_GATEWAY_TOKEN"',
+            'wire_api = "responses"',
+        ]
+    )
+
+tmp_path.write_text("\n".join(out).rstrip() + "\n")
+PY
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CONFIG"
+}
+
+cmd_provider_status() {
+  python3 - "$CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError as exc:
+    raise SystemExit(f"tomllib unavailable: {exc}")
+
+path = Path(sys.argv[1])
+data = {}
+if path.exists():
+    data = tomllib.loads(path.read_text())
+
+provider = data.get("model_provider") or "openai"
+model = data.get("model") or "?"
+odin = data.get("model_providers", {}).get("odin", {})
+print(f"provider: {provider}")
+print(f"model:    {model}")
+if odin:
+    print(f"odin:     {odin.get('base_url', '?')}")
+PY
+  local active; active=$(active_provider_name)
+  [[ -n "$active" ]] && echo "slot:     $active"
+  return 0
+}
+
+cmd_provider_use() {
+  local provider="${1:-}"
+  [[ -n "$provider" ]] || die "usage: codex-acct provider use {openai|odin}"
+  shift || true
+
+  local restart=1
+  local model=""
+  local base_url=""
+  while (($#)); do
+    case "$1" in
+      --no-daemon-restart) restart=0; shift ;;
+      --model)
+        [[ -n "${2:-}" ]] || die "--model requires a value"
+        model="$2"
+        shift 2
+        ;;
+      --model=*)
+        model="${1#--model=}"
+        shift
+        ;;
+      --base-url)
+        [[ -n "${2:-}" ]] || die "--base-url requires a value"
+        base_url="$2"
+        shift 2
+        ;;
+      --base-url=*)
+        base_url="${1#--base-url=}"
+        shift
+        ;;
+      *)
+        die "unknown provider option: $1"
+        ;;
+    esac
+  done
+
+  case "$provider" in
+    odin)
+      local env_base_url="" env_model="" env_defaults="" env_file=""
+      if [[ -z "$base_url" || -z "$model" ]]; then
+        env_defaults=$(read_odin_env_defaults || true)
+        if [[ -n "$env_defaults" ]]; then
+          IFS=$'\t' read -r env_base_url env_model <<< "$env_defaults"
+        fi
+      fi
+      model="${model:-${ODIN_GATEWAY_MODEL:-${env_model:-gpt-5.5}}}"
+      base_url="${base_url:-${ODIN_GATEWAY_BASE_URL:-${env_base_url:-}}}"
+      if [[ -z "$base_url" ]]; then
+        base_url=$(current_odin_base_url)
+      fi
+      [[ -n "$base_url" ]] || die "Odin base URL required: set ODIN_GATEWAY_BASE_URL or pass --base-url"
+      update_provider_config odin "$model" "$base_url"
+      write_active_provider_name odin
+      env_file=$(odin_env_file)
+      if [[ -z "${ODIN_GATEWAY_TOKEN:-}" && -z "$env_file" ]]; then
+        echo "note: ODIN_GATEWAY_TOKEN is not set in this shell; Codex runs need it at runtime." >&2
+      fi
+      (( restart )) && restart_daemon
+      echo "provider now: odin  ($model)"
+      ;;
+    openai)
+      model="${model:-${CODEX_ACCT_OPENAI_MODEL:-gpt-5.5}}"
+      update_provider_config openai "$model" ""
+      write_active_provider_name openai
+      (( restart )) && restart_daemon
+      echo "provider now: openai  ($model)"
+      ;;
+    *)
+      die "unknown provider '$provider' (expected: openai or odin)"
+      ;;
+  esac
+}
+
+cmd_provider() {
+  local action="${1:-status}"
+  shift || true
+  case "$action" in
+    status|who) cmd_provider_status "$@" ;;
+    use|switch) cmd_provider_use "$@" ;;
+    *)
+      die "usage: codex-acct provider {status|use openai|use odin}"
+      ;;
+  esac
+}
 
 cmd_who() {
+  local provider; provider=$(config_provider)
+  if [[ "$provider" == "odin" ]]; then
+    cmd_provider_status
+    return 0
+  fi
+
   [[ -f "$AUTH" ]] || die "no $AUTH — run: codex login"
   IFS=$'\t' read -r email plan sub acct < <(decode_auth "$AUTH")
   echo "email:      ${email:-?}"
@@ -260,22 +743,23 @@ cmd_who() {
 
 cmd_list() {
   local cur_sub; cur_sub=$(current_sub)
+  local cur_provider; cur_provider=$(config_provider)
+  local cur_model; cur_model=$(config_model)
   local prim; prim=$(primary_name)
   shopt -s nullglob
   local files=("$ACCTS"/*.json)
-  if (( ${#files[@]} == 0 )); then
-    echo "(no saved accounts — use: codex-acct save <name>)"
-    return
-  fi
   printf '%-20s %-32s %-8s %s\n' "NAME" "EMAIL" "PLAN" "FLAGS"
   for f in "${files[@]}"; do
     local name; name=$(basename "$f" .json)
     IFS=$'\t' read -r email plan sub _acct < <(decode_auth "$f")
     local flags=""
-    [[ "$sub" == "$cur_sub" && -n "$sub" ]] && flags+="active "
+    [[ "$cur_provider" != "odin" && "$sub" == "$cur_sub" && -n "$sub" ]] && flags+="active "
     [[ "$name" == "$prim" ]] && flags+="primary "
     printf '%-20s %-32s %-8s %s\n' "$name" "${email:-?}" "${plan:-?}" "$flags"
   done
+  local odin_flags=""
+  [[ "$cur_provider" == "odin" ]] && odin_flags+="active "
+  printf '%-20s %-32s %-8s %s\n' "odin" "(provider)" "$cur_model" "$odin_flags"
 }
 
 require_name() {
@@ -286,6 +770,7 @@ require_name() {
 cmd_save() {
   require_name "${1:-}" save
   local name="$1"
+  reserved_provider_name "$name" && die "'$name' is reserved for provider switching"
   [[ -f "$AUTH" ]] || die "no $AUTH to save"
   local dest="$ACCTS/$name.json"
   if [[ -f "$dest" && "${2:-}" != "--force" ]]; then
@@ -314,8 +799,18 @@ cmd_use() {
 
   require_name "${1:-}" use
   local name="$1"
+  shift || true
+  if reserved_provider_name "$name"; then
+    local provider_args=("$name")
+    (( restart == 0 )) && provider_args+=("--no-daemon-restart")
+    provider_args+=("$@")
+    cmd_provider_use "${provider_args[@]}"
+    return
+  fi
+
   local src="$ACCTS/$name.json"
   [[ -f "$src" ]] || die "no saved account '$name' (see: codex-acct list)"
+  local prior_provider; prior_provider=$(config_provider)
 
   local prim; prim=$(primary_name)
   if [[ -n "$prim" && -f "$ACCTS/$prim.json" ]]; then
@@ -335,6 +830,10 @@ cmd_use() {
   copy_auth_atomic "$src" "$AUTH"
 
   write_active_name "$name"
+  if [[ "$prior_provider" == "odin" ]]; then
+    update_provider_config openai "${CODEX_ACCT_OPENAI_MODEL:-$(config_model)}" ""
+    write_active_provider_name openai
+  fi
   (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
   echo "now using: $name  ($email, $plan)"
@@ -353,6 +852,7 @@ cmd_add() {
 
   require_name "${1:-}" add
   local name="$1"
+  reserved_provider_name "$name" && die "'$name' is reserved for provider switching"
   local dest="$ACCTS/$name.json"
   [[ -f "$dest" ]] && die "$dest exists — pick a new name or rm it first"
 
@@ -377,6 +877,10 @@ cmd_add() {
   [[ -f "$AUTH" ]] || die "login did not produce $AUTH"
   copy_auth_atomic "$AUTH" "$dest"
   write_active_name "$name"
+  if [[ "$(config_provider)" == "odin" ]]; then
+    update_provider_config openai "${CODEX_ACCT_OPENAI_MODEL:-$(config_model)}" ""
+    write_active_provider_name openai
+  fi
   (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$dest")
   echo "added & active: $name  ($email, $plan)"
@@ -385,6 +889,7 @@ cmd_add() {
 cmd_primary() {
   require_name "${1:-}" primary
   local name="$1"
+  reserved_provider_name "$name" && die "'$name' is reserved for provider switching"
   [[ -f "$ACCTS/$name.json" ]] || die "no saved account '$name'"
   echo -n "$name" > "$PRIMARY_FILE"
   chmod 600 "$PRIMARY_FILE"
@@ -404,6 +909,7 @@ cmd_restore() {
 
   local src="$ACCTS/$PREV_NAME.json"
   [[ -f "$src" ]] || die "no previous account snapshot to restore"
+  local prior_provider; prior_provider=$(config_provider)
   # Save live state back to its named slot first (freshness)
   sync_active_slot
   copy_auth_atomic "$src" "$AUTH"
@@ -417,6 +923,10 @@ cmd_restore() {
   done
   if [[ -n "$matched" ]]; then write_active_name "$matched"
   else rm -f "$ACTIVE_FILE"
+  fi
+  if [[ "$prior_provider" == "odin" ]]; then
+    update_provider_config openai "${CODEX_ACCT_OPENAI_MODEL:-$(config_model)}" ""
+    write_active_provider_name openai
   fi
   (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
@@ -436,15 +946,70 @@ cmd_sync() {
 
 cmd_run_codex() {
   local rc=0
+  local codex_bin
+  codex_bin=$(real_codex_bin)
   with_lock sync_active_slot
-  codex "$@" || rc=$?
+  if [[ "$(config_provider)" == "odin" ]]; then
+    load_odin_env_for_child
+  fi
+  "$codex_bin" "$@" || rc=$?
   with_lock sync_active_slot
   return "$rc"
+}
+
+cmd_install_wrapper() {
+  [[ $# -eq 0 ]] || die "usage: codex-acct install-wrapper"
+  mkdir -p "$(dirname "$CODEX_WRAPPER")"
+  local self tmp real
+  self=$(script_path)
+  real="$CODEX_REAL"
+
+  if [[ "$CODEX_WRAPPER" == "$real" ]]; then
+    die "wrapper path and real codex path must be different"
+  fi
+
+  if [[ -e "$CODEX_WRAPPER" || -L "$CODEX_WRAPPER" ]]; then
+    if is_managed_codex_wrapper "$CODEX_WRAPPER"; then
+      [[ -x "$real" ]] || die "managed wrapper exists but real codex is missing: $real"
+    else
+      [[ ! -e "$real" && ! -L "$real" ]] || die "$real already exists; refusing to overwrite it"
+      mv "$CODEX_WRAPPER" "$real"
+    fi
+  else
+    local found
+    found=$(real_codex_bin)
+    ln -s "$found" "$real"
+  fi
+
+  [[ -x "$real" ]] || die "real codex is not executable: $real"
+
+  tmp=$(mktemp "$(dirname "$CODEX_WRAPPER")/.codex-acct-wrapper.XXXXXX")
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# codex-acct managed wrapper'
+    echo 'set -euo pipefail'
+    printf 'export CODEX_ACCT_REAL_CODEX=%s\n' "$(shell_quote "$real")"
+    printf 'exec %s codex "$@"\n' "$(shell_quote "$self")"
+  } > "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$CODEX_WRAPPER"
+  echo "installed codex wrapper: $CODEX_WRAPPER -> codex-acct codex"
+  echo "real codex: $real"
+}
+
+cmd_uninstall_wrapper() {
+  [[ $# -eq 0 ]] || die "usage: codex-acct uninstall-wrapper"
+  [[ -e "$CODEX_WRAPPER" || -L "$CODEX_WRAPPER" ]] || die "codex wrapper not found: $CODEX_WRAPPER"
+  is_managed_codex_wrapper "$CODEX_WRAPPER" || die "not a codex-acct managed wrapper: $CODEX_WRAPPER"
+  [[ -e "$CODEX_REAL" || -L "$CODEX_REAL" ]] || die "real codex backup not found: $CODEX_REAL"
+  mv -f "$CODEX_REAL" "$CODEX_WRAPPER"
+  echo "restored real codex: $CODEX_WRAPPER"
 }
 
 cmd_rm() {
   require_name "${1:-}" rm
   local name="$1"
+  reserved_provider_name "$name" && die "'$name' is a virtual provider slot and cannot be removed"
   local f="$ACCTS/$name.json"
   [[ -f "$f" ]] || die "no saved account '$name'"
   rm -f "$f"
@@ -512,11 +1077,22 @@ codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
                                      switch to saved <name> (atomic swap +
                                      restart of the codex app-server daemon so
                                      codex re-reads auth)
+  codex-acct use  odin [--model MODEL] [--base-url URL]
+                                     switch to the Odin Responses provider
   codex-acct add  <name> [--no-daemon-restart]
                                      run codex login, save result as <name>
                                      (also restarts the app-server daemon)
   codex-acct sync                    persist live auth.json into the active slot
   codex-acct codex [args...]         run codex, then save any rotated tokens on exit
+  codex-acct install-wrapper         make plain 'codex' run through codex-acct
+  codex-acct uninstall-wrapper       restore the original plain 'codex' launcher
+  codex-acct provider status         show active model provider from config.toml
+  codex-acct provider use odin [--base-url URL] [--model MODEL]
+                                     explicit form of: use odin
+  codex-acct provider use openai [--model MODEL]
+                                     switch config.toml back to the default OpenAI provider
+  codex-acct odin [--base-url URL]   shorthand for: provider use odin
+  codex-acct openai                  shorthand for: provider use openai
   codex-acct primary <name>          mark <name> as the macbook-paired account
   codex-acct restore [--no-daemon-restart]
                                      swap back to the previous account
@@ -539,6 +1115,11 @@ case "$sub" in
   add|login) with_lock cmd_add "$@" ;;
   sync) with_lock cmd_sync "$@" ;;
   codex|run) cmd_run_codex "$@" ;;
+  install-wrapper|install-codex-wrapper) cmd_install_wrapper "$@" ;;
+  uninstall-wrapper|uninstall-codex-wrapper) cmd_uninstall_wrapper "$@" ;;
+  provider) with_lock cmd_provider "$@" ;;
+  odin) with_lock cmd_provider_use odin "$@" ;;
+  openai) with_lock cmd_provider_use openai "$@" ;;
   primary) with_lock cmd_primary "$@" ;;
   restore) with_lock cmd_restore "$@" ;;
   rm|remove|delete) with_lock cmd_rm "$@" ;;
