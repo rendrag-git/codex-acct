@@ -97,6 +97,9 @@ setup_home() {
 SH
   chmod +x "$CODEX_HOME/daemon-manager"
   export CODEX_ACCT_DAEMON_MANAGER="$CODEX_HOME/daemon-manager"
+  printf '%s\n' test-cliproxy-key > "$CODEX_HOME/cliproxy.key"
+  chmod 600 "$CODEX_HOME/cliproxy.key"
+  export CODEX_ACCT_CLIPROXY_API_KEY_FILE="$CODEX_HOME/cliproxy.key"
 }
 
 setup_fake_codex() {
@@ -535,8 +538,10 @@ TOML
   fi
 }
 
-test_use_real_account_leaves_normal_provider_unchanged() {
+test_use_primary_and_secondary_selects_cliproxy_without_changing_model() {
   setup_home real-account-provider
+  make_auth primary-sub primary@example.test primary-r1 "$CODEX_HOME/accounts/primary.json"
+  make_auth second-sub secondary@example.test second-r1 "$CODEX_HOME/accounts/second.json"
   cp "$CODEX_HOME/accounts/work.json" "$CODEX_HOME/auth.json"
   printf work > "$CODEX_HOME/accounts/.active"
   cat > "$CODEX_HOME/config.toml" <<'TOML'
@@ -547,15 +552,66 @@ sandbox_mode = "workspace-write"
 trust_level = "trusted"
 TOML
 
-  "$ROOT/codex-acct" use personal >/dev/null
+  "$ROOT/codex-acct" use secondary >/dev/null
 
-  assert_eq gpt-5.4 "$(toml_get "$CODEX_HOME/config.toml" model)" "normal account switch preserved model"
-  assert_eq "" "$(toml_get_optional "$CODEX_HOME/config.toml" model_provider)" "normal account switch preserved default provider"
-  assert_eq trusted "$(toml_project_trust "$CODEX_HOME/config.toml" /tmp/example)" "normal account switch preserved project trust"
+  assert_eq gpt-5.4 "$(toml_get "$CODEX_HOME/config.toml" model)" "secondary preserved selected model"
+  assert_eq second "$(cat "$CODEX_HOME/accounts/.active")" "secondary selected existing second slot"
+  assert_eq cliproxy "$(toml_get "$CODEX_HOME/config.toml" model_provider)" "secondary selected CLIProxy provider"
+  assert_eq sol-second "$(toml_get "$CODEX_HOME/config.toml" model_providers.cliproxy.http_headers.X-CLIProxy-Auth-Model)" "secondary selected its proxy account"
+  assert_eq trusted "$(toml_project_trust "$CODEX_HOME/config.toml" /tmp/example)" "secondary preserved project trust"
+
+  "$ROOT/codex-acct" use primary >/dev/null
+
+  assert_eq gpt-5.4 "$(toml_get "$CODEX_HOME/config.toml" model)" "primary preserved selected model"
+  assert_eq primary "$(cat "$CODEX_HOME/accounts/.active")" "primary selected primary slot"
+  assert_eq sol-primary "$(toml_get "$CODEX_HOME/config.toml" model_providers.cliproxy.http_headers.X-CLIProxy-Auth-Model)" "primary selected its proxy account"
 }
 
-test_use_real_account_after_odin_restores_normal_provider() {
+test_restore_reselects_previous_cliproxy_account_without_changing_model() {
+  setup_home restore-cliproxy
+  make_auth primary-sub primary@example.test primary-r1 "$CODEX_HOME/accounts/primary.json"
+  make_auth second-sub secondary@example.test second-r1 "$CODEX_HOME/accounts/second.json"
+  cp "$CODEX_HOME/accounts/primary.json" "$CODEX_HOME/auth.json"
+  printf primary > "$CODEX_HOME/accounts/.active"
+  cat > "$CODEX_HOME/config.toml" <<'TOML'
+model = "gpt-5.4"
+TOML
+
+  "$ROOT/codex-acct" use secondary >/dev/null
+  "$ROOT/codex-acct" restore >/dev/null
+
+  assert_eq gpt-5.4 "$(toml_get "$CODEX_HOME/config.toml" model)" "restore preserved selected model"
+  assert_eq primary "$(cat "$CODEX_HOME/accounts/.active")" "restore selected previous primary slot"
+  assert_eq sol-primary "$(toml_get "$CODEX_HOME/config.toml" model_providers.cliproxy.http_headers.X-CLIProxy-Auth-Model)" "restore selected previous proxy account"
+}
+
+test_unpinned_account_after_cliproxy_restores_openai_without_changing_model() {
+  setup_home cliproxy-to-unpinned
+  cp "$CODEX_HOME/accounts/work.json" "$CODEX_HOME/auth.json"
+  printf work > "$CODEX_HOME/accounts/.active"
+  cat > "$CODEX_HOME/config.toml" <<'TOML'
+model = "gpt-5.4"
+model_provider = "cliproxy"
+
+[model_providers.cliproxy]
+name = "Local CLIProxyAPI"
+base_url = "http://127.0.0.1:8317/v1"
+env_key = "CODEX_ACCT_CLIPROXY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+http_headers = { "X-CLIProxy-Auth-Model" = "sol-second" }
+TOML
+
+  "$ROOT/codex-acct" use personal >/dev/null
+
+  assert_eq gpt-5.4 "$(toml_get "$CODEX_HOME/config.toml" model)" "unpinned account preserved selected model"
+  assert_eq "" "$(toml_get_optional "$CODEX_HOME/config.toml" model_provider)" "unpinned account restored direct OpenAI provider"
+  assert_eq personal "$(cat "$CODEX_HOME/accounts/.active")" "unpinned account selected its saved slot"
+}
+
+test_use_real_account_after_odin_selects_cliproxy_without_changing_model() {
   setup_home odin-to-real
+  make_auth primary-sub primary@example.test primary-r1 "$CODEX_HOME/accounts/primary.json"
   cp "$CODEX_HOME/accounts/work.json" "$CODEX_HOME/auth.json"
   printf work > "$CODEX_HOME/accounts/.active"
   cat > "$CODEX_HOME/config.toml" <<'TOML'
@@ -573,12 +629,12 @@ wire_api = "responses"
 trust_level = "trusted"
 TOML
 
-  "$ROOT/codex-acct" use personal >/dev/null
+  "$ROOT/codex-acct" use primary >/dev/null
 
-  assert_eq gpt-5.5 "$(toml_get "$CODEX_HOME/config.toml" model)" "real account after odin preserved model"
-  assert_eq "" "$(toml_get_optional "$CODEX_HOME/config.toml" model_provider)" "real account after odin restored default provider"
-  assert_eq "https://gateway.example/api/odin/gateway/openai/v1" "$(toml_get "$CODEX_HOME/config.toml" model_providers.odin.base_url)" "real account after odin preserved odin block"
-  assert_eq openai "$(cat "$CODEX_HOME/providers/.active")" "real account after odin recorded normal provider"
+  assert_eq gpt-5.5 "$(toml_get "$CODEX_HOME/config.toml" model)" "primary after odin preserved selected model"
+  assert_eq cliproxy "$(toml_get "$CODEX_HOME/config.toml" model_provider)" "primary after odin selected CLIProxy provider"
+  assert_eq sol-primary "$(toml_get "$CODEX_HOME/config.toml" model_providers.cliproxy.http_headers.X-CLIProxy-Auth-Model)" "primary after odin selected its proxy account"
+  assert_eq "https://gateway.example/api/odin/gateway/openai/v1" "$(toml_get "$CODEX_HOME/config.toml" model_providers.odin.base_url)" "primary after odin preserved odin block"
 }
 
 test_openai_can_be_a_saved_account_name() {
@@ -669,8 +725,10 @@ test_repair_wrapper_is_noop_when_healthy
 test_repair_wrapper_refuses_unknown_file
 test_update_runs_npm_then_repairs_wrapper
 test_list_shows_odin_as_virtual_slot
-test_use_real_account_leaves_normal_provider_unchanged
-test_use_real_account_after_odin_restores_normal_provider
+test_use_primary_and_secondary_selects_cliproxy_without_changing_model
+test_restore_reselects_previous_cliproxy_account_without_changing_model
+test_unpinned_account_after_cliproxy_restores_openai_without_changing_model
+test_use_real_account_after_odin_selects_cliproxy_without_changing_model
 test_openai_can_be_a_saved_account_name
 test_provider_switch_openai_removes_top_level_provider_and_preserves_odin_block
 test_daemon_restart_carries_odin_token_and_clears_it_for_openai

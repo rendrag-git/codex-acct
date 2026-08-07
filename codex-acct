@@ -12,6 +12,8 @@ ACTIVE_FILE="$ACCTS/.active"
 ACTIVE_PROVIDER_FILE="$PROVIDERS/.active"
 PREV_NAME="_previous"
 ODIN_ENV_FILE_DEFAULT="$HOME/projects/odin/.env.1password"
+CLIPROXY_BASE_URL="${CODEX_ACCT_CLIPROXY_BASE_URL:-http://127.0.0.1:8317/v1}"
+CLIPROXY_API_KEY_FILE="${CODEX_ACCT_CLIPROXY_API_KEY_FILE:-$HOME/.cli-proxy-api/.local-api-key}"
 CODEX_WRAPPER="${CODEX_ACCT_CODEX_WRAPPER:-$HOME/.local/bin/codex}"
 CODEX_REAL="${CODEX_ACCT_REAL_CODEX:-$HOME/.local/bin/codex.codex-acct-real}"
 LOCK_DIR="$CODEX_DIR/.codex-acct.lock"
@@ -142,11 +144,19 @@ daemon_listener_pid() {
 # launching shell only helps if the daemon we spawn inherits it. ChatGPT/OpenAI needs the
 # var absent so a stale token never leaks into an OpenAI-backed daemon.
 set_daemon_env_for_active_provider() {
-  if [[ "$(config_provider)" == "odin" ]]; then
-    load_odin_env_for_child
-  else
-    unset ODIN_GATEWAY_TOKEN ODIN_GATEWAY_BASE_URL ODIN_GATEWAY_MODEL 2>/dev/null || true
-  fi
+  case "$(config_provider)" in
+    odin)
+      unset CODEX_ACCT_CLIPROXY_API_KEY 2>/dev/null || true
+      load_odin_env_for_child
+      ;;
+    cliproxy)
+      unset ODIN_GATEWAY_TOKEN ODIN_GATEWAY_BASE_URL ODIN_GATEWAY_MODEL 2>/dev/null || true
+      load_cliproxy_env_for_child
+      ;;
+    *)
+      unset ODIN_GATEWAY_TOKEN ODIN_GATEWAY_BASE_URL ODIN_GATEWAY_MODEL CODEX_ACCT_CLIPROXY_API_KEY 2>/dev/null || true
+      ;;
+  esac
 }
 
 # Stop the current daemon listener (and its immediate parent) and drop the stale socket.
@@ -189,17 +199,21 @@ spawn_daemon() {
 }
 
 restart_daemon() {
-  local provider
+  local provider daemon_token=""
   provider=$(config_provider)
   echo "restarting codex app-server daemon (provider=$provider)..."
   # Order matters: config.toml is already on the target provider, so resolve the daemon
   # env for it, tear the old daemon down, then bring up a replacement carrying that env.
   set_daemon_env_for_active_provider
+  case "$provider" in
+    odin) daemon_token="${ODIN_GATEWAY_TOKEN:-}" ;;
+    cliproxy) daemon_token="${CODEX_ACCT_CLIPROXY_API_KEY:-}" ;;
+  esac
   # Test seam: when an override manager is provided, delegate the real process lifecycle
   # to it (so the suite can assert intent — which provider, whether a token was resolved —
   # without spawning a real app-server) and skip the live kill/spawn.
   if [[ -n "${CODEX_ACCT_DAEMON_MANAGER:-}" ]]; then
-    "$CODEX_ACCT_DAEMON_MANAGER" "$provider" "${ODIN_GATEWAY_TOKEN:-}"
+    "$CODEX_ACCT_DAEMON_MANAGER" "$provider" "$daemon_token"
     return $?
   fi
   stop_daemon
@@ -332,6 +346,28 @@ reserved_provider_name() {
   [[ "${1:-}" == "odin" ]]
 }
 
+account_slot_name() {
+  case "$1" in
+    secondary) printf '%s\n' second ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+display_account_name() {
+  case "$1" in
+    second) printf '%s\n' secondary ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+cliproxy_auth_model_for_account() {
+  case "$1" in
+    primary) printf '%s\n' sol-primary ;;
+    second|secondary) printf '%s\n' sol-second ;;
+    *) return 1 ;;
+  esac
+}
+
 odin_env_file() {
   if [[ -n "${CODEX_ACCT_ODIN_ENV_FILE:-}" ]]; then
     echo "$CODEX_ACCT_ODIN_ENV_FILE"
@@ -420,6 +456,32 @@ load_odin_env_for_child() {
   [[ -n "$model" && -z "${ODIN_GATEWAY_MODEL:-}" ]] && export ODIN_GATEWAY_MODEL="$model"
 }
 
+cliproxy_api_key() {
+  if [[ -n "${CODEX_ACCT_CLIPROXY_API_KEY:-}" ]]; then
+    printf '%s\n' "$CODEX_ACCT_CLIPROXY_API_KEY"
+  elif [[ -f "$CLIPROXY_API_KEY_FILE" ]]; then
+    local key
+    key=$(<"$CLIPROXY_API_KEY_FILE")
+    [[ -n "$key" ]] || return 1
+    printf '%s\n' "$key"
+  else
+    return 1
+  fi
+}
+
+require_cliproxy_api_key() {
+  cliproxy_api_key >/dev/null \
+    || die "CLIProxyAPI key not found: set CODEX_ACCT_CLIPROXY_API_KEY or create $CLIPROXY_API_KEY_FILE"
+}
+
+load_cliproxy_env_for_child() {
+  [[ -n "${CODEX_ACCT_CLIPROXY_API_KEY:-}" ]] && return 0
+  local key
+  key=$(cliproxy_api_key) \
+    || die "CLIProxyAPI is active but its local API key could not be loaded from $CLIPROXY_API_KEY_FILE"
+  export CODEX_ACCT_CLIPROXY_API_KEY="$key"
+}
+
 config_provider() {
   python3 - "$CONFIG" <<'PY'
 import sys
@@ -503,7 +565,7 @@ update_provider_config() {
   mkdir -p "$CODEX_DIR"
   local tmp
   tmp=$(mktemp "$CODEX_DIR/.config.XXXXXX")
-  python3 - "$CONFIG" "$tmp" "$provider" "$model" "$base_url" <<'PY'
+  python3 - "$CONFIG" "$tmp" "$provider" "$model" "$base_url" "$CODEX_DIR/odin-model-catalog.json" <<'PY'
 import json
 import re
 import sys
@@ -514,6 +576,11 @@ tmp_path = Path(sys.argv[2])
 provider = sys.argv[3]
 model = sys.argv[4]
 base_url = sys.argv[5]
+# Static picker catalog for the Odin provider: the gateway 404s GET /models, so
+# codex's remote model list can never refresh there. The key is global, so it is
+# removed again when switching back to openai (which has live model discovery).
+# A missing catalog file is fatal to codex startup, hence the is_file() guards.
+catalog_path = Path(sys.argv[6])
 
 def toml_string(value: str) -> str:
     return json.dumps(value)
@@ -528,6 +595,13 @@ def normalize_odin_base(url: str) -> str:
 
 text = config_path.read_text() if config_path.exists() else ""
 lines = text.splitlines()
+
+if provider == "odin" and not catalog_path.is_file():
+    print(
+        f"warning: {catalog_path} missing; model_catalog_json left unset "
+        "(regenerate with odin/backend/build_codex_model_catalog.py)",
+        file=sys.stderr,
+    )
 
 # Replace any existing Odin provider block only when writing a fresh Odin block.
 # Switching back to OpenAI leaves the block in place so the next Odin switch can
@@ -550,15 +624,19 @@ out = []
 at_top = True
 saw_model = False
 saw_model_provider = False
+saw_model_catalog = False
 
 def emit_missing_top_level() -> None:
-    global saw_model, saw_model_provider
+    global saw_model, saw_model_provider, saw_model_catalog
     if not saw_model:
         out.append(f"model = {toml_string(model)}")
         saw_model = True
     if provider == "odin" and not saw_model_provider:
         out.append('model_provider = "odin"')
         saw_model_provider = True
+    if provider == "odin" and not saw_model_catalog and catalog_path.is_file():
+        out.append(f"model_catalog_json = {toml_string(str(catalog_path))}")
+        saw_model_catalog = True
 
 for line in without_odin:
     if at_top and re.match(r"\s*\[", line):
@@ -576,6 +654,12 @@ for line in without_odin:
         if provider == "odin":
             out.append('model_provider = "odin"')
             saw_model_provider = True
+        continue
+
+    if at_top and re.match(r"\s*model_catalog_json\s*=", line):
+        if provider == "odin" and catalog_path.is_file():
+            out.append(f"model_catalog_json = {toml_string(str(catalog_path))}")
+            saw_model_catalog = True
         continue
 
     out.append(line)
@@ -598,6 +682,78 @@ if provider == "odin":
         ]
     )
 
+tmp_path.write_text("\n".join(out).rstrip() + "\n")
+PY
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CONFIG"
+}
+
+update_cliproxy_config() {
+  local auth_model="$1"
+  mkdir -p "$CODEX_DIR"
+  local tmp
+  tmp=$(mktemp "$CODEX_DIR/.config.XXXXXX")
+  python3 - "$CONFIG" "$tmp" "$CLIPROXY_BASE_URL" "$auth_model" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+tmp_path = Path(sys.argv[2])
+base_url = sys.argv[3].rstrip("/")
+auth_model = sys.argv[4]
+if base_url.endswith("/responses"):
+    base_url = base_url[: -len("/responses")]
+if not base_url.endswith("/v1"):
+    base_url += "/v1"
+
+lines = config_path.read_text().splitlines() if config_path.exists() else []
+filtered = []
+skip = False
+for line in lines:
+    if re.match(r"\s*\[model_providers\.cliproxy\]\s*(?:#.*)?$", line):
+        skip = True
+        continue
+    if skip and re.match(r"\s*\[", line):
+        skip = False
+    if not skip:
+        filtered.append(line)
+
+out = []
+at_top = True
+saw_provider = False
+for line in filtered:
+    if at_top and re.match(r"\s*\[", line):
+        if not saw_provider:
+            out.append('model_provider = "cliproxy"')
+            saw_provider = True
+        at_top = False
+        out.append(line)
+        continue
+    if at_top and re.match(r"\s*model_provider\s*=", line):
+        out.append('model_provider = "cliproxy"')
+        saw_provider = True
+        continue
+    if at_top and re.match(r"\s*model_catalog_json\s*=", line):
+        continue
+    out.append(line)
+if at_top and not saw_provider:
+    out.append('model_provider = "cliproxy"')
+
+if out and out[-1] != "":
+    out.append("")
+out.extend(
+    [
+        "[model_providers.cliproxy]",
+        'name = "Local CLIProxyAPI"',
+        f"base_url = {json.dumps(base_url)}",
+        'env_key = "CODEX_ACCT_CLIPROXY_API_KEY"',
+        'wire_api = "responses"',
+        "requires_openai_auth = false",
+        f'http_headers = {{ "X-CLIProxy-Auth-Model" = {json.dumps(auth_model)} }}',
+    ]
+)
 tmp_path.write_text("\n".join(out).rstrip() + "\n")
 PY
   chmod 600 "$tmp"
@@ -729,7 +885,7 @@ cmd_who() {
   echo "plan:       ${plan:-?}"
   echo "account_id: ${acct:-?}"
   local active; active=$(active_name)
-  [[ -n "$active" ]] && echo "slot:       $active"
+  [[ -n "$active" ]] && echo "slot:       $(display_account_name "$active")"
   local prim; prim=$(primary_name)
   if [[ -n "$prim" && -f "$ACCTS/$prim.json" ]]; then
     local psub; psub=$(decode_auth "$ACCTS/$prim.json" | cut -f3)
@@ -750,12 +906,12 @@ cmd_list() {
   local files=("$ACCTS"/*.json)
   printf '%-20s %-32s %-8s %s\n' "NAME" "EMAIL" "PLAN" "FLAGS"
   for f in "${files[@]}"; do
-    local name; name=$(basename "$f" .json)
+    local name display_name; name=$(basename "$f" .json); display_name=$(display_account_name "$name")
     IFS=$'\t' read -r email plan sub _acct < <(decode_auth "$f")
     local flags=""
     [[ "$cur_provider" != "odin" && "$sub" == "$cur_sub" && -n "$sub" ]] && flags+="active "
     [[ "$name" == "$prim" ]] && flags+="primary "
-    printf '%-20s %-32s %-8s %s\n' "$name" "${email:-?}" "${plan:-?}" "$flags"
+    printf '%-20s %-32s %-8s %s\n' "$display_name" "${email:-?}" "${plan:-?}" "$flags"
   done
   local odin_flags=""
   [[ "$cur_provider" == "odin" ]] && odin_flags+="active "
@@ -798,18 +954,23 @@ cmd_use() {
   set -- "${args[@]}"
 
   require_name "${1:-}" use
-  local name="$1"
+  local requested_name="$1"
   shift || true
-  if reserved_provider_name "$name"; then
-    local provider_args=("$name")
+  if reserved_provider_name "$requested_name"; then
+    local provider_args=("$requested_name")
     (( restart == 0 )) && provider_args+=("--no-daemon-restart")
     provider_args+=("$@")
     cmd_provider_use "${provider_args[@]}"
     return
   fi
 
+  local name; name=$(account_slot_name "$requested_name")
   local src="$ACCTS/$name.json"
-  [[ -f "$src" ]] || die "no saved account '$name' (see: codex-acct list)"
+  [[ -f "$src" ]] || die "no saved account '$requested_name' (see: codex-acct list)"
+  (($# == 0)) || die "unknown account option: $1"
+  local cliproxy_auth_model=""
+  cliproxy_auth_model=$(cliproxy_auth_model_for_account "$name" || true)
+  [[ -z "$cliproxy_auth_model" ]] || require_cliproxy_api_key
   local prior_provider; prior_provider=$(config_provider)
 
   local prim; prim=$(primary_name)
@@ -830,13 +991,16 @@ cmd_use() {
   copy_auth_atomic "$src" "$AUTH"
 
   write_active_name "$name"
-  if [[ "$prior_provider" == "odin" ]]; then
+  if [[ -n "$cliproxy_auth_model" ]]; then
+    update_cliproxy_config "$cliproxy_auth_model"
+    write_active_provider_name cliproxy
+  elif [[ "$prior_provider" == "odin" || "$prior_provider" == "cliproxy" ]]; then
     update_provider_config openai "${CODEX_ACCT_OPENAI_MODEL:-$(config_model)}" ""
     write_active_provider_name openai
   fi
   (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
-  echo "now using: $name  ($email, $plan)"
+  echo "now using: $requested_name  ($email, $plan)"
 }
 
 cmd_add() {
@@ -909,28 +1073,32 @@ cmd_restore() {
 
   local src="$ACCTS/$PREV_NAME.json"
   [[ -f "$src" ]] || die "no previous account snapshot to restore"
-  local prior_provider; prior_provider=$(config_provider)
-  # Save live state back to its named slot first (freshness)
-  sync_active_slot
-  copy_auth_atomic "$src" "$AUTH"
-  # Try to figure out which named slot the restored auth corresponds to
-  local rsub; rsub=$(current_sub)
-  local matched=""
+  local restored_sub matched="" cliproxy_auth_model=""
+  restored_sub=$(auth_sub "$src") || die "previous account snapshot has no decodable identity"
   shopt -s nullglob
   for f in "$ACCTS"/*.json; do
     local nm; nm=$(basename "$f" .json); [[ "$nm" == "$PREV_NAME" ]] && continue
-    [[ "$(decode_auth "$f" | cut -f3)" == "$rsub" && -n "$rsub" ]] && { matched="$nm"; break; }
+    [[ "$(auth_sub "$f" || true)" == "$restored_sub" ]] && { matched="$nm"; break; }
   done
-  if [[ -n "$matched" ]]; then write_active_name "$matched"
-  else rm -f "$ACTIVE_FILE"
-  fi
-  if [[ "$prior_provider" == "odin" ]]; then
+  [[ -n "$matched" ]] || die "previous account does not match a saved slot"
+  cliproxy_auth_model=$(cliproxy_auth_model_for_account "$matched" || true)
+  [[ -z "$cliproxy_auth_model" ]] || require_cliproxy_api_key
+
+  # Save live state back to its named slot first (freshness), then restore both
+  # the previous auth snapshot and its matching provider selection.
+  sync_active_slot
+  copy_auth_atomic "$src" "$AUTH"
+  write_active_name "$matched"
+  if [[ -n "$cliproxy_auth_model" ]]; then
+    update_cliproxy_config "$cliproxy_auth_model"
+    write_active_provider_name cliproxy
+  else
     update_provider_config openai "${CODEX_ACCT_OPENAI_MODEL:-$(config_model)}" ""
     write_active_provider_name openai
   fi
   (( restart )) && restart_daemon
   IFS=$'\t' read -r email plan _sub _acct < <(decode_auth "$AUTH")
-  echo "restored previous: ($email, $plan)${matched:+  [active slot: $matched]}"
+  echo "restored previous: ($email, $plan)${matched:+  [active slot: $(display_account_name "$matched")]}"
 }
 
 cmd_sync() {
@@ -949,9 +1117,10 @@ cmd_run_codex() {
   local codex_bin
   codex_bin=$(real_codex_bin)
   with_lock sync_active_slot
-  if [[ "$(config_provider)" == "odin" ]]; then
-    load_odin_env_for_child
-  fi
+  case "$(config_provider)" in
+    odin) load_odin_env_for_child ;;
+    cliproxy) load_cliproxy_env_for_child ;;
+  esac
   "$codex_bin" "$@" || rc=$?
   with_lock sync_active_slot
   return "$rc"
@@ -1105,10 +1274,29 @@ cmd_rm() {
 WATCH_PID_FILE="$CODEX_DIR/watch.pid"
 WATCH_LOG_FILE="$CODEX_DIR/watch.log"
 
+# Check systemd FIRST: codex-acct-watch normally runs as a user unit, whose PID
+# this script never wrote to WATCH_PID_FILE. Consulting only the pidfile made
+# `watch status` report "not running" while the unit was healthy, prompting a
+# second hand-started watcher; the duplicate doubled writes into
+# ~/.codex/accounts and tripped codex-acct-bridge's start limit, silently
+# killing credential sync for a week (2026-07-22 .. 2026-07-29).
 watch_running() {
+  if systemctl --user is-active --quiet codex-acct-watch.service 2>/dev/null; then
+    return 0
+  fi
   [[ -f "$WATCH_PID_FILE" ]] || return 1
   local pid; pid=$(cat "$WATCH_PID_FILE" 2>/dev/null || echo "")
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Human-readable source of the running watcher, for status output.
+watch_source() {
+  if systemctl --user is-active --quiet codex-acct-watch.service 2>/dev/null; then
+    printf 'systemd unit codex-acct-watch.service, pid %s' \
+      "$(systemctl --user show codex-acct-watch.service -p MainPID --value)"
+  else
+    printf 'pid %s (pidfile)' "$(cat "$WATCH_PID_FILE" 2>/dev/null)"
+  fi
 }
 
 cmd_watch() {
@@ -1116,7 +1304,7 @@ cmd_watch() {
   case "$action" in
     start)
       if watch_running; then
-        echo "already running (pid $(cat "$WATCH_PID_FILE"))"
+        echo "already running ($(watch_source))"
         return 0
       fi
       local bin
@@ -1128,6 +1316,10 @@ cmd_watch() {
       echo "started (pid $(cat "$WATCH_PID_FILE"))"
       ;;
     stop)
+      if systemctl --user is-active --quiet codex-acct-watch.service 2>/dev/null; then
+        echo "watcher is managed by systemd; use: systemctl --user stop codex-acct-watch.service"
+        return 1
+      fi
       if ! watch_running; then
         rm -f "$WATCH_PID_FILE"
         echo "not running"
@@ -1140,7 +1332,7 @@ cmd_watch() {
       ;;
     status)
       if watch_running; then
-        echo "running (pid $(cat "$WATCH_PID_FILE"))"
+        echo "running ($(watch_source))"
       else
         echo "not running"
       fi
@@ -1158,10 +1350,9 @@ codex-acct — switch Codex (ChatGPT) accounts by swapping ~/.codex/auth.json
   codex-acct who                     show current account
   codex-acct list                    list saved accounts
   codex-acct save <name> [--force]   snapshot current auth.json as <name>
-  codex-acct use  <name> [--no-daemon-restart]
-                                     switch to saved <name> (atomic swap +
-                                     restart of the codex app-server daemon so
-                                     codex re-reads auth)
+  codex-acct use  {primary|secondary} [--no-daemon-restart]
+                                     select that CLIProxyAPI OAuth account
+                                     without changing the selected model
   codex-acct use  odin [--model MODEL] [--base-url URL]
                                      switch to the Odin Responses provider
   codex-acct add  <name> [--no-daemon-restart]

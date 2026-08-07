@@ -93,6 +93,19 @@ codex login                    # if you don't already have a session
 codex-acct save personal       # snapshot the current ~/.codex/auth.json
 ```
 
+## CLIProxyAPI account selection
+
+The saved names `primary` and `secondary` select account-pinned OAuth credentials through a local CLIProxyAPI instance without changing Codex's selected model:
+
+```sh
+codex-acct use primary
+codex-acct use secondary       # maps to the historical second.json slot
+```
+
+The switcher writes a `cliproxy` provider block to `~/.codex/config.toml` and sets the private `X-CLIProxy-Auth-Model` header to `sol-primary` or `sol-second`. A compatible CLIProxyAPI build uses that header only for credential selection and strips it before the upstream request. CLIProxyAPI continues to own and refresh its OAuth copies; `codex-acct` does not copy refreshed proxy tokens back into its saved slots.
+
+The default endpoint is `http://127.0.0.1:8317/v1`, and the default local key file is `~/.cli-proxy-api/.local-api-key`. Override them with `CODEX_ACCT_CLIPROXY_BASE_URL` and `CODEX_ACCT_CLIPROXY_API_KEY_FILE`. Other saved account names retain the direct OpenAI provider behavior.
+
 `odin` is a virtual slot because it needs a different Codex provider block than
 normal ChatGPT/Codex accounts. Switching to `odin` edits only the top-level
 `model` / `model_provider` settings and the `[model_providers.odin]` block in
